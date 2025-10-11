@@ -17,6 +17,9 @@ const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000",
 const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10); // e.g. 90000
 let lastActivityAt = Date.now();
 
+// Optional toggle to force proxy (handy for debugging / hotfixes)
+const FORCE_PROXY = (process.env.FORCE_PROXY || "").toLowerCase() === "true";
+
 // ---------- utils ----------
 const b64url = (b) => Buffer.from(b).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
 const unb64url = (s) => Buffer.from(s.replace(/-/g,"+").replace(/_/g,"/"), "base64");
@@ -83,6 +86,18 @@ function rewriteM3U8(text, sourceUrl, selfOrigin, ttlSec, headers) {
 function looksLikeM3U8(urlObj, contentType) {
   if (contentType && /application\/vnd\.apple\.mpegurl|application\/x-mpegURL|audio\/mpegurl/i.test(contentType)) return true;
   return /\.m3u8($|\?)/i.test(urlObj.pathname);
+}
+
+// ---------- direct-play heuristic ----------
+async function isDirectPlayable(url) {
+  try {
+    const r = await fetch(url, { method: "HEAD", redirect: "follow" });
+    const rangeOk = (r.headers.get("accept-ranges") || "").toLowerCase().includes("bytes");
+    const notHls  = !/\.m3u8($|\?)/i.test(new URL(url).pathname);
+    return rangeOk && notHls;
+  } catch {
+    return false;
+  }
 }
 
 // ---------- yt-dlp ----------
@@ -162,10 +177,6 @@ const server = http.createServer(async (req, res) => {
           if (best.headers?.["User-Agent"]) upstreamHeaders["User-Agent"] = best.headers["User-Agent"];
           upstreamHeaders["Referer"] = best.headers?.["Referer"] || new URL(pageUrl).origin;
 
-          const expiresAt = nowSec() + TOKEN_TTL_SEC;
-          const token = signToken({ u: best.url, exp: expiresAt, h: upstreamHeaders });
-          const proxyUrl = `${selfOrigin}/proxy?token=${encodeURIComponent(token)}`;
-
           const metaFrom = best.metaFrom || {};
           const meta = {
             title: metaFrom.title,
@@ -176,8 +187,29 @@ const server = http.createServer(async (req, res) => {
             webpage_url: metaFrom.webpage_url
           };
 
+          // Prefer direct URL when safe (non-HLS + byte ranges), unless FORCE_PROXY is set
+          if (!FORCE_PROXY && await isDirectPlayable(best.url)) {
+            const expiresAt = nowSec() + TOKEN_TTL_SEC; // hint for client refresh (not used by server)
+            res.writeHead(200, { "Content-Type":"application/json" })
+              .end(JSON.stringify({
+                ok: true,
+                mode: "direct",
+                type: best.type,
+                directUrl: best.url,
+                expiresAt,
+                meta
+              }));
+            console.log("[INFO] /extract -> direct URL (no proxy)");
+            return;
+          }
+
+          // Fallback: sign + proxy (HLS or when direct not safe)
+          const expiresAt = nowSec() + TOKEN_TTL_SEC;
+          const token = signToken({ u: best.url, exp: expiresAt, h: upstreamHeaders });
+          const proxyUrl = `${selfOrigin}/proxy?token=${encodeURIComponent(token)}`;
+
           res.writeHead(200, { "Content-Type":"application/json" })
-            .end(JSON.stringify({ ok:true, type: best.type, proxyUrl, expiresAt, meta }));
+            .end(JSON.stringify({ ok:true, mode: "proxy", type: best.type, proxyUrl, expiresAt, meta }));
 
         } catch (e) {
           console.error("extract error:", e);
