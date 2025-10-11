@@ -13,6 +13,10 @@ const UA_DEFAULT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000", 10);
 
+// ---- auto-exit on idle ----
+const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10); // e.g. 90000
+let lastActivityAt = Date.now();
+
 // ---------- utils ----------
 const b64url = (b) => Buffer.from(b).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
 const unb64url = (s) => Buffer.from(s.replace(/-/g,"+").replace(/_/g,"/"), "base64");
@@ -42,6 +46,7 @@ function cors(res) {
   res.setHeader("Access-Control-Expose-Headers", "Content-Range,Accept-Ranges,Content-Length,Content-Type");
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   res.setHeader("Timing-Allow-Origin", CORS_ALLOW);
+  res.setHeader("Connection", "close"); // encourage quick idle
 }
 
 function getSelfOrigin(req) {
@@ -110,6 +115,7 @@ function pickBest(lines) {
 
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
+  lastActivityAt = Date.now(); // mark any incoming request
   const started = Date.now();
   const selfOrigin = getSelfOrigin(req);
   const u = new URL(req.url, `${selfOrigin}`);
@@ -133,7 +139,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Root can show a tiny banner
+    // Root
     if (req.method === "GET" && u.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" }).end("resolver+proxy up");
       return;
@@ -256,7 +262,10 @@ const server = http.createServer(async (req, res) => {
       try {
         if (upstream.body) {
           const nodeReadable = Readable.fromWeb(upstream.body);
-          nodeReadable.on("error", (e) => { try { res.end(); } catch(_){} });
+          // keep the process "active" while streaming
+          nodeReadable.on("data", () => { lastActivityAt = Date.now(); });
+          nodeReadable.on("error", () => { try { res.end(); } catch(_){} });
+          nodeReadable.on("end",   () => { /* done */ });
           nodeReadable.pipe(res);
         } else {
           res.end();
@@ -278,4 +287,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// tighten idle sockets a bit
+server.keepAliveTimeout = 5000; // 5s
+server.headersTimeout   = 8000; // 8s
+
 server.listen(PORT, () => console.log(`resolver+proxy listening on :${PORT}`));
+
+// graceful auto-exit watchdog
+if (AUTO_EXIT_IDLE_MS > 0) {
+  setInterval(() => {
+    const idle = Date.now() - lastActivityAt;
+    if (idle > AUTO_EXIT_IDLE_MS) {
+      console.log(`[EXIT] idle ${idle}ms > ${AUTO_EXIT_IDLE_MS}ms, exiting`);
+      setTimeout(() => process.exit(0), 200);
+    }
+  }, Math.min(AUTO_EXIT_IDLE_MS, 10000));
+}
