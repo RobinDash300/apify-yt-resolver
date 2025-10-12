@@ -19,9 +19,10 @@ const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
 let lastActivityAt = Date.now();
 
 // ---------- utils ----------
-const b64url = (b) => Buffer.from(b).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
-const unb64url = (s) => Buffer.from(s.replace(/-/g,"+").replace(/_/g,"/"), "base64");
-const nowSec = () => Math.floor(Date.now()/1000);
+const b64url = (b) =>
+  Buffer.from(b).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64url = (s) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+const nowSec = () => Math.floor(Date.now() / 1000);
 
 function signToken(payloadObj) {
   const body = b64url(JSON.stringify(payloadObj));
@@ -41,8 +42,14 @@ function verifyToken(token) {
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", CORS_ALLOW);
   res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,Authorization,X-Requested-With,Origin,Accept");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Range,Accept-Ranges,Content-Length,Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type,Range,Authorization,X-Requested-With,Origin,Accept"
+  );
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Content-Range,Accept-Ranges,Content-Length,Content-Type"
+  );
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   res.setHeader("Timing-Allow-Origin", CORS_ALLOW);
   res.setHeader("Vary", "Origin, Range");
@@ -56,7 +63,11 @@ function getSelfOrigin(req) {
 
 // ---------- HLS helpers ----------
 function toAbsoluteUrl(base, ref) {
-  try { return new URL(ref).toString(); } catch { return new URL(ref, base).toString(); }
+  try {
+    return new URL(ref).toString();
+  } catch {
+    return new URL(ref, base).toString();
+  }
 }
 function proxify(selfOrigin, absUrl, ttlSec, headers) {
   const exp = nowSec() + ttlSec;
@@ -65,50 +76,92 @@ function proxify(selfOrigin, absUrl, ttlSec, headers) {
 }
 function rewriteM3U8(text, sourceUrl, selfOrigin, ttlSec, headers) {
   const lines = text.split(/\r?\n/);
-  return lines.map(line => {
-    if (!line || line.startsWith("#")) {
-      if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP")) {
-        return line.replace(/URI="([^"]+)"/, (_m, uriVal) => {
-          const abs = toAbsoluteUrl(sourceUrl, uriVal);
-          return `URI="${proxify(selfOrigin, abs, ttlSec, headers)}"`;
-        });
+  return lines
+    .map((line) => {
+      if (!line || line.startsWith("#")) {
+        if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP")) {
+          return line.replace(/URI="([^"]+)"/, (_m, uriVal) => {
+            const abs = toAbsoluteUrl(sourceUrl, uriVal);
+            return `URI="${proxify(selfOrigin, abs, ttlSec, headers)}"`;
+          });
+        }
+        return line;
       }
-      return line;
-    }
-    const abs = toAbsoluteUrl(sourceUrl, line.trim());
-    return proxify(selfOrigin, abs, ttlSec, headers);
-  }).join("\n");
+      const abs = toAbsoluteUrl(sourceUrl, line.trim());
+      return proxify(selfOrigin, abs, ttlSec, headers);
+    })
+    .join("\n");
 }
 function looksLikeM3U8(urlObj, contentType) {
-  if (contentType && /application\/vnd\.apple\.mpegurl|application\/x-mpegURL|audio\/mpegurl/i.test(contentType)) return true;
+  if (
+    contentType &&
+    /application\/vnd\.apple\.mpegurl|application\/x-mpegURL|audio\/mpegurl/i.test(contentType)
+  )
+    return true;
   return /\.m3u8($|\?)/i.test(urlObj.pathname);
+}
+
+// ---------- media detection ----------
+function looksDirectMedia(urlStr) {
+  try {
+    const { pathname } = new URL(urlStr);
+    return /\.(mp4|webm|m4v|mov|m3u8)(\?|$)/i.test(pathname);
+  } catch {
+    return false;
+  }
 }
 
 // ---------- yt-dlp ----------
 function ytdlpJson(userUrl) {
   return new Promise((resolve, reject) => {
     const args = ["-j", "--no-warnings", "--skip-download", userUrl];
-    const p = spawn("yt-dlp", args, { stdio: ["ignore","pipe","pipe"] });
-    let out = "", err = "";
-    p.stdout.on("data", d => out += d);
-    p.stderr.on("data", d => err += d);
-    p.on("close", code => {
+    const p = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "",
+      err = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (err += d));
+    p.on("close", (code) => {
       if (code !== 0 || !out.trim()) return reject(new Error(err || `yt-dlp exited ${code}`));
       try {
-        const lines = out.trim().split(/\r?\n/).map(l => JSON.parse(l));
+        const lines = out
+          .trim()
+          .split(/\r?\n/)
+          .map((l) => JSON.parse(l));
         resolve(lines);
-      } catch (e) { reject(e); }
+      } catch (e) {
+        reject(e);
+      }
     });
   });
 }
 function pickBest(lines) {
-  const allFormats = lines.flatMap(j => j.formats || []).filter(Boolean);
-  let hls = allFormats.find(f => (f.protocol?.includes("m3u8") || /\.m3u8/i.test(f.url || "")));
-  if (hls) return { url: hls.url, type: "hls", headers: lines[0]?.http_headers || hls.http_headers || null, metaFrom: lines[0] };
-  const best = allFormats.filter(f => f.url).sort((a,b)=> (b.tbr||0)-(a.tbr||0))[0];
-  if (best) return { url: best.url, type: best.ext || "mp4", headers: lines[0]?.http_headers || best.http_headers || null, metaFrom: lines[0] };
-  const single = lines.find(j => j.url);
-  if (single) return { url: single.url, type: single.ext || "unknown", headers: single.http_headers || null, metaFrom: single };
+  const allFormats = lines.flatMap((j) => j.formats || []).filter(Boolean);
+  const hls = allFormats.find(
+    (f) => f && (f.protocol?.includes("m3u8") || /\.m3u8/i.test(f.url || ""))
+  );
+  if (hls)
+    return {
+      url: hls.url,
+      type: "hls",
+      headers: lines[0]?.http_headers || hls.http_headers || null,
+      metaFrom: lines[0],
+    };
+  const best = allFormats.filter((f) => f.url).sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+  if (best)
+    return {
+      url: best.url,
+      type: best.ext || "mp4",
+      headers: lines[0]?.http_headers || best.http_headers || null,
+      metaFrom: lines[0],
+    };
+  const single = lines.find((j) => j.url);
+  if (single)
+    return {
+      url: single.url,
+      type: single.ext || "unknown",
+      headers: single.http_headers || null,
+      metaFrom: single,
+    };
   return null;
 }
 
@@ -122,92 +175,179 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`[REQ] ${req.method} ${u.pathname}${u.search || ""}`);
 
-  // Apify standby readiness
+  // standby readiness
   if (req.headers["x-apify-container-server-readiness-probe"]) {
     res.writeHead(200, { "Content-Type": "text/plain" }).end("OK");
     return;
   }
-  if (req.method === "OPTIONS") { res.writeHead(204).end(); return; }
+  if (req.method === "OPTIONS") {
+    res.writeHead(204).end();
+    return;
+  }
 
   try {
-    // Health
+    // health
     if (u.pathname === "/_health") {
       res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
       return;
     }
 
-    // Root
+    // root
     if (req.method === "GET" && u.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" }).end("resolver+proxy up");
       return;
     }
 
-    // POST /extract -> always proxy
+    // POST /extract -> always proxy (page URL or direct URL)
     if (req.method === "POST" && u.pathname === "/extract") {
       let body = "";
-      req.on("data", d => body += d);
+      req.on("data", (d) => (body += d));
       req.on("end", async () => {
         try {
           const { url: pageUrl } = JSON.parse(body || "{}");
-          if (!pageUrl) { res.writeHead(400).end('{"ok":false,"error":"Missing url"}'); return; }
+          if (!pageUrl) {
+            res.writeHead(400).end('{"ok":false,"error":"Missing url"}');
+            return;
+          }
 
-          const lines = await ytdlpJson(pageUrl);
-          const best = pickBest(lines);
-          if (!best) { res.writeHead(404).end(JSON.stringify({ ok:false, error:"No playable URL" })); return; }
+          let mediaUrl = pageUrl;
+          let headers = null;
+          let metaFrom = null;
 
-          const upstreamHeaders = {};
-          if (best.headers?.["User-Agent"]) upstreamHeaders["User-Agent"] = best.headers["User-Agent"];
-          upstreamHeaders["Referer"] = best.headers?.["Referer"] || new URL(pageUrl).origin;
+          if (!looksDirectMedia(pageUrl)) {
+            const lines = await ytdlpJson(pageUrl);
+            const best = pickBest(lines);
+            if (!best) {
+              res.writeHead(404).end(JSON.stringify({ ok: false, error: "No playable URL" }));
+              return;
+            }
+            mediaUrl = best.url;
+            headers = best.headers || null;
+            metaFrom = best.metaFrom || null;
+          }
 
-          const metaFrom = best.metaFrom || {};
-          const meta = {
-            title: metaFrom.title,
-            duration: metaFrom.duration,
-            width: metaFrom.width || metaFrom.width_height?.[0],
-            height: metaFrom.height || metaFrom.width_height?.[1],
-            extractor: metaFrom.extractor,
-            webpage_url: metaFrom.webpage_url
-          };
+          // default headers and TikTok referer hardening
+          const upstreamHeaders = headers ? { ...headers } : {};
+          if (!upstreamHeaders["User-Agent"]) upstreamHeaders["User-Agent"] = UA_DEFAULT;
+          if (!upstreamHeaders["Referer"]) {
+            try {
+              const host = new URL(pageUrl).host || "";
+              if (host.includes("tiktok")) upstreamHeaders["Referer"] = "https://www.tiktok.com/";
+              else upstreamHeaders["Referer"] = new URL(pageUrl).origin;
+            } catch {
+              // ignore
+            }
+          }
+
+          const meta = metaFrom
+            ? {
+                title: metaFrom.title,
+                duration: metaFrom.duration,
+                width: metaFrom.width || metaFrom.width_height?.[0],
+                height: metaFrom.height || metaFrom.width_height?.[1],
+                extractor: metaFrom.extractor,
+                webpage_url: metaFrom.webpage_url,
+              }
+            : null;
 
           const expiresAt = nowSec() + TOKEN_TTL_SEC;
-          const signed = signToken({ u: best.url, exp: expiresAt, h: upstreamHeaders });
+          const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders });
           const proxyUrl = `${selfOrigin}/proxy?${PROXY_PARAM}=${encodeURIComponent(signed)}`;
 
-          res.writeHead(200, { "Content-Type":"application/json" })
-            .end(JSON.stringify({ ok:true, mode:"proxy", type: best.type, proxyUrl, expiresAt, meta }));
+          res
+            .writeHead(200, { "Content-Type": "application/json" })
+            .end(JSON.stringify({ ok: true, mode: "proxy", type: "auto", proxyUrl, expiresAt, meta }));
         } catch (e) {
           console.error("extract error:", e);
-          res.writeHead(502, { "Content-Type":"application/json" })
-            .end(JSON.stringify({ ok:false, error:String(e) }));
+          res
+            .writeHead(502, { "Content-Type": "application/json" })
+            .end(JSON.stringify({ ok: false, error: String(e) }));
         } finally {
-          console.log(`[END] /extract in ${Date.now()-started}ms`);
+          console.log(`[END] /extract in ${Date.now() - started}ms`);
         }
       });
       return;
     }
 
-    // GET /sign?u=... -> always proxy
+    // GET /sign?u=... -> now universal: accepts page or direct, always returns proxy
     if (req.method === "GET" && u.pathname === "/sign") {
-      const direct = u.searchParams.get("u");
-      if (!direct) { res.writeHead(400).end('{"ok":false,"error":"Missing u"}'); return; }
-      let directUrl;
-      try { directUrl = new URL(direct).toString(); } catch { res.writeHead(400).end('{"ok":false,"error":"Bad URL"}'); return; }
-      const expiresAt = nowSec() + TOKEN_TTL_SEC;
-      const signed = signToken({ u: directUrl, exp: expiresAt, h: null });
-      const proxyUrl = `${selfOrigin}/proxy?${PROXY_PARAM}=${encodeURIComponent(signed)}`;
-      res.writeHead(200, { "Content-Type":"application/json" })
-        .end(JSON.stringify({ ok:true, proxyUrl, expiresAt }));
-      console.log(`[END] /sign in ${Date.now()-started}ms`);
-      return;
+      const input = u.searchParams.get("u");
+      if (!input) {
+        res.writeHead(400).end('{"ok":false,"error":"Missing u"}');
+        return;
+      }
+
+      let abs;
+      try {
+        abs = new URL(input).toString();
+      } catch {
+        res.writeHead(400).end('{"ok":false,"error":"Bad URL"}');
+        return;
+      }
+
+      try {
+        let mediaUrl = abs;
+        let headers = null;
+        let metaFrom = null;
+
+        if (!looksDirectMedia(abs)) {
+          const lines = await ytdlpJson(abs);
+          const best = pickBest(lines);
+          if (!best) {
+            res.writeHead(404).end(JSON.stringify({ ok: false, error: "No playable URL" }));
+            return;
+          }
+          mediaUrl = best.url;
+          headers = best.headers || null;
+          metaFrom = best.metaFrom || null;
+        }
+
+        // default headers and TikTok referer hardening
+        const upstreamHeaders = headers ? { ...headers } : {};
+        if (!upstreamHeaders["User-Agent"]) upstreamHeaders["User-Agent"] = UA_DEFAULT;
+        if (!upstreamHeaders["Referer"]) {
+          try {
+            const host = new URL(abs).host || "";
+            if (host.includes("tiktok")) upstreamHeaders["Referer"] = "https://www.tiktok.com/";
+            else upstreamHeaders["Referer"] = new URL(abs).origin;
+          } catch {
+            // ignore
+          }
+        }
+
+        const expiresAt = nowSec() + TOKEN_TTL_SEC;
+        const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders });
+        const proxyUrl = `${selfOrigin}/proxy?${PROXY_PARAM}=${encodeURIComponent(signed)}`;
+
+        res
+          .writeHead(200, { "Content-Type": "application/json" })
+          .end(JSON.stringify({ ok: true, proxyUrl, expiresAt }));
+        console.log(`[END] /sign -> proxy in ${Date.now() - started}ms`);
+        return;
+      } catch (e) {
+        console.error("sign error:", e);
+        res
+          .writeHead(502, { "Content-Type": "application/json" })
+          .end(JSON.stringify({ ok: false, error: String(e) }));
+        return;
+      }
     }
 
     // GET or HEAD /proxy?sig=...
     if ((req.method === "GET" || req.method === "HEAD") && u.pathname === "/proxy") {
       const signed = u.searchParams.get(PROXY_PARAM);
-      if (!signed) { res.writeHead(400).end("Missing signature"); return; }
+      if (!signed) {
+        res.writeHead(400).end("Missing signature");
+        return;
+      }
 
       let payload;
-      try { payload = verifyToken(signed); } catch { res.writeHead(403).end("Invalid signature"); return; }
+      try {
+        payload = verifyToken(signed);
+      } catch {
+        res.writeHead(403).end("Invalid signature");
+        return;
+      }
 
       const upstreamUrl = new URL(payload.u);
       const range = req.headers.range;
@@ -215,7 +355,7 @@ const server = http.createServer(async (req, res) => {
 
       const h = { "User-Agent": ua };
       if (payload.h?.["Referer"]) h["Referer"] = payload.h["Referer"];
-      if (payload.h?.["Cookie"])  h["Cookie"]  = payload.h["Cookie"];
+      if (payload.h?.["Cookie"]) h["Cookie"] = payload.h["Cookie"];
 
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
@@ -226,7 +366,7 @@ const server = http.createServer(async (req, res) => {
           method: req.method, // GET or HEAD
           redirect: "follow",
           headers: { ...(range ? { Range: range } : {}), ...h },
-          signal: controller.signal
+          signal: controller.signal,
         });
       } catch (err) {
         clearTimeout(t);
@@ -238,61 +378,84 @@ const server = http.createServer(async (req, res) => {
       }
 
       const ct = upstream.headers.get("content-type") || "";
-      // HLS manifest rewrite
+
+      // If HLS, rewrite playlist so nested URIs also go through our proxy
       if (req.method === "GET" && looksLikeM3U8(upstreamUrl, ct)) {
         const manifest = await upstream.text();
-        const rewritten = rewriteM3U8(manifest, upstreamUrl, selfOrigin, TOKEN_TTL_SEC, payload.h || null);
+        const rewritten = rewriteM3U8(
+          manifest,
+          upstreamUrl,
+          selfOrigin,
+          TOKEN_TTL_SEC,
+          payload.h || null
+        );
         res.setHeader("Cache-Control", "no-store");
-        res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" }).end(rewritten);
-        console.log(`[END] /proxy (m3u8) in ${Date.now()-started}ms`);
+        res
+          .writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" })
+          .end(rewritten);
+        console.log(`[END] /proxy (m3u8) in ${Date.now() - started}ms`);
         return;
       }
 
-      // Forward headers needed for playback and canvas
+      // pass through headers needed for playback and canvas
       const acceptRanges = upstream.headers.get("accept-ranges");
       const contentRange = upstream.headers.get("content-range");
       const contentLength = upstream.headers.get("content-length");
       const contentType = upstream.headers.get("content-type");
 
-      if (acceptRanges)   res.setHeader("Accept-Ranges", acceptRanges);
-      if (contentRange)   res.setHeader("Content-Range", contentRange);
-      if (contentLength)  res.setHeader("Content-Length", contentLength);
-      if (contentType)    res.setHeader("Content-Type", contentType);
+      if (acceptRanges) res.setHeader("Accept-Ranges", acceptRanges);
+      if (contentRange) res.setHeader("Content-Range", contentRange);
+      if (contentLength) res.setHeader("Content-Length", contentLength);
+      if (contentType) res.setHeader("Content-Type", contentType);
       if (!res.getHeader("Cache-Control")) res.setHeader("Cache-Control", "no-store");
 
       res.writeHead(upstream.status);
 
-      if (req.method === "HEAD") { res.end(); console.log(`[END] /proxy HEAD in ${Date.now()-started}ms`); return; }
+      if (req.method === "HEAD") {
+        res.end();
+        console.log(`[END] /proxy HEAD in ${Date.now() - started}ms`);
+        return;
+      }
 
       try {
         if (upstream.body) {
           const nodeReadable = Readable.fromWeb(upstream.body);
-          nodeReadable.on("data", () => { lastActivityAt = Date.now(); });
-          nodeReadable.on("error", () => { try { res.end(); } catch{} });
+          nodeReadable.on("data", () => {
+            lastActivityAt = Date.now();
+          });
+          nodeReadable.on("error", () => {
+            try {
+              res.end();
+            } catch {}
+          });
           nodeReadable.pipe(res);
         } else {
           res.end();
         }
       } catch (e) {
         console.error("stream pipe error:", e);
-        try { res.end(); } catch {}
+        try {
+          res.end();
+        } catch {}
       } finally {
-        console.log(`[END] /proxy passthrough in ${Date.now()-started}ms`);
+        console.log(`[END] /proxy passthrough in ${Date.now() - started}ms`);
       }
       return;
     }
 
     // 404
-    res.writeHead(404, { "Content-Type":"text/plain" }).end("Not found");
+    res.writeHead(404, { "Content-Type": "text/plain" }).end("Not found");
   } catch (e) {
     console.error("server error:", e);
-    try { res.writeHead(500).end(String(e)); } catch {}
+    try {
+      res.writeHead(500).end(String(e));
+    } catch {}
   }
 });
 
 // ---------- server tune ----------
 server.keepAliveTimeout = 5000;
-server.headersTimeout   = 8000;
+server.headersTimeout = 8000;
 
 server.listen(PORT, () => console.log(`resolver+proxy listening on :${PORT}`));
 
