@@ -12,6 +12,8 @@ const TOKEN_TTL_SEC = parseInt(process.env.TOKEN_TTL_SEC || "300", 10);
 const CORS_ALLOW = process.env.CORS_ALLOW || "*";
 const UA_DEFAULT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
+const UA_TIKTOK =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000", 10);
 const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10);
 const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
@@ -179,41 +181,45 @@ const CANON = {
 };
 const ALLOW_SET = new Set(Object.keys(CANON));
 
-function buildUpstreamHeaders(baseHeaders, pageUrlOrAbs) {
+function buildUpstreamHeaders(baseHeaders, pageOrMediaUrl, canonicalPageUrl) {
   const H = {};
   const src = baseHeaders || {};
 
-  // copy only allowed, normalize case
   for (const [k, v] of Object.entries(src)) {
     if (!v) continue;
     const lower = k.toLowerCase();
     if (ALLOW_SET.has(lower)) H[CANON[lower]] = v;
   }
 
-  // defaults
-  if (!H["User-Agent"]) H["User-Agent"] = UA_DEFAULT;
-
-  try {
-    const host = new URL(pageUrlOrAbs).host || "";
-    if (host.includes("tiktok")) {
-      if (!H["Referer"]) H["Referer"] = "https://www.tiktok.com/";
-      if (!H["Origin"]) H["Origin"] = "https://www.tiktok.com";
-    } else {
-      if (!H["Origin"] && H["Referer"]) {
-        try {
-          H["Origin"] = new URL(H["Referer"]).origin;
-        } catch {}
-      }
-      if (!H["Origin"]) {
-        try {
-          H["Origin"] = new URL(pageUrlOrAbs).origin;
-        } catch {}
-      }
-    }
-  } catch {}
-
   if (!H["Accept"]) H["Accept"] = "*/*";
   if (!H["Accept-Language"]) H["Accept-Language"] = "en-US,en;q=0.5";
+
+  if (canonicalPageUrl && !H["Referer"]) H["Referer"] = canonicalPageUrl;
+
+  try {
+    if (!H["Origin"] && H["Referer"]) H["Origin"] = new URL(H["Referer"]).origin;
+  } catch {}
+  if (!H["Origin"]) {
+    try {
+      H["Origin"] = new URL(pageOrMediaUrl).origin;
+    } catch {}
+  }
+
+  try {
+    const host = new URL(pageOrMediaUrl).host || "";
+    if (host.includes("tiktok")) {
+      if (!H["User-Agent"]) H["User-Agent"] = UA_TIKTOK;
+      if (!H["Referer"]) H["Referer"] = "https://www.tiktok.com/";
+      if (!H["Origin"]) H["Origin"] = "https://www.tiktok.com";
+      if (!H["Sec-Fetch-Mode"]) H["Sec-Fetch-Mode"] = "cors";
+      if (!H["Sec-Fetch-Site"]) H["Sec-Fetch-Site"] = "cross-site";
+      if (!H["Sec-Fetch-Dest"]) H["Sec-Fetch-Dest"] = "video";
+    }
+  } catch {
+    if (!H["User-Agent"]) H["User-Agent"] = UA_DEFAULT;
+  }
+
+  if (!H["User-Agent"]) H["User-Agent"] = UA_DEFAULT;
 
   return H;
 }
@@ -228,7 +234,6 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`[REQ] ${req.method} ${u.pathname}${u.search || ""}`);
 
-  // readiness for Standby
   if (req.headers["x-apify-container-server-readiness-probe"]) {
     res.writeHead(200, { "Content-Type": "text/plain" }).end("OK");
     return;
@@ -239,19 +244,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // health
     if (u.pathname === "/_health") {
       res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
       return;
     }
 
-    // root
     if (req.method === "GET" && u.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" }).end("resolver+proxy up");
       return;
     }
 
-    // POST /extract -> accepts page or direct, always returns proxy
+    // POST /extract -> page or direct, always returns proxy
     if (req.method === "POST" && u.pathname === "/extract") {
       let body = "";
       req.on("data", (d) => (body += d));
@@ -279,7 +282,8 @@ const server = http.createServer(async (req, res) => {
             metaFrom = best.metaFrom || null;
           }
 
-          const upstreamHeaders = buildUpstreamHeaders(headers, pageUrl);
+          const canonical = metaFrom?.webpage_url || pageUrl;
+          const upstreamHeaders = buildUpstreamHeaders(headers, mediaUrl, canonical);
 
           const meta = metaFrom
             ? {
@@ -344,7 +348,8 @@ const server = http.createServer(async (req, res) => {
           metaFrom = best.metaFrom || null;
         }
 
-        const upstreamHeaders = buildUpstreamHeaders(headers, abs);
+        const canonical = metaFrom?.webpage_url || abs;
+        const upstreamHeaders = buildUpstreamHeaders(headers, mediaUrl, canonical);
 
         const expiresAt = nowSec() + TOKEN_TTL_SEC;
         const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders });
@@ -381,13 +386,14 @@ const server = http.createServer(async (req, res) => {
       }
 
       const upstreamUrl = new URL(payload.u);
-      const range = req.headers.range;
+      const clientRange = req.headers.range;
       const ua = req.headers["user-agent"] || UA_DEFAULT;
 
-      // build forwarded headers, prefer ones in the signed payload
+      // Build forwarded headers
       const h = {};
       h["User-Agent"] =
-        (payload.h && (payload.h["User-Agent"] || payload.h["user-agent"])) || ua;
+        (payload.h && (payload.h["User-Agent"] || payload.h["user-agent"])) ||
+        (upstreamUrl.host.includes("tiktok") ? UA_TIKTOK : ua);
 
       const COPY = [
         "Referer",
@@ -404,6 +410,17 @@ const server = http.createServer(async (req, res) => {
         if (v) h[name] = v;
       }
 
+      // Avoid gzip for video
+      h["Accept-Encoding"] = "identity";
+
+      // Force Range for obvious file URLs if client did not send it
+      let range = clientRange;
+      if (!range) {
+        const p = upstreamUrl.pathname.toLowerCase();
+        if (p.endsWith(".mp4") || p.endsWith(".m4v") || p.endsWith(".webm") || p.endsWith(".mov")) {
+          range = "bytes=0-";
+        }
+      }
       const reqHeaders = { ...(range ? { Range: range } : {}), ...h };
 
       const controller = new AbortController();
@@ -426,7 +443,32 @@ const server = http.createServer(async (req, res) => {
         clearTimeout(t);
       }
 
-      const ct = upstream.headers.get("content-type") || "";
+      let ct = upstream.headers.get("content-type") || "";
+
+      // Retry once for TikTok if HTML or not ok
+      if (
+        (!upstream.ok || /^text\/html/i.test(ct)) &&
+        upstreamUrl.host.includes("tiktok")
+      ) {
+        const retryHeaders = {
+          ...reqHeaders,
+          "User-Agent": UA_TIKTOK,
+          "Referer": reqHeaders["Referer"] || "https://www.tiktok.com/",
+          "Origin": reqHeaders["Origin"] || "https://www.tiktok.com",
+          "Accept-Encoding": "identity",
+        };
+        if (!retryHeaders.Range) retryHeaders.Range = "bytes=0-";
+
+        upstream = await fetch(upstreamUrl.toString(), {
+          method: req.method,
+          redirect: "follow",
+          headers: retryHeaders,
+          signal: controller.signal,
+        });
+
+        ct = upstream.headers.get("content-type") || "";
+      }
+
       if (
         !upstream.ok &&
         !/^(video|application\/vnd\.apple\.mpegurl|application\/x-mpegURL)/i.test(ct)
@@ -452,7 +494,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // pass through headers needed for playback and canvas
+      // Pass through important headers
       const acceptRanges = upstream.headers.get("accept-ranges");
       const contentRange = upstream.headers.get("content-range");
       const contentLength = upstream.headers.get("content-length");
