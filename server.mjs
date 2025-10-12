@@ -16,57 +16,11 @@ const UA_TIKTOK =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000", 10);
 const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10);
-const PROXY_PARAM = process.env.PROXY_PARAM || "sig";
+const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
 
-// yt-dlp related env
-const YT_COOKIES_PATH = process.env.YT_COOKIES_PATH || ""; // optional cookies file for YouTube
-const YTDLP_ARGS = (process.env.YTDLP_ARGS || "").trim(); // optional extra args, space separated
-const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp"; // override binary if needed
-
-// proxy env
-const STATIC_PROXY_URL =
-  process.env.PROXY_URL ||
-  process.env.APIFY_PROXY_URL ||
-  process.env.HTTP_PROXY ||
-  process.env.HTTPS_PROXY ||
-  "";
-
-// ---------- proxy support (fetch and yt-dlp) ----------
-let PROXY_CONTEXT = null;
-async function getProxyContext() {
-  if (PROXY_CONTEXT) return PROXY_CONTEXT;
-
-  let proxyUrl = STATIC_PROXY_URL || null;
-  let dispatcher = null;
-
-  if (!proxyUrl) {
-    // Try Apify proxy if available
-    try {
-      const { Actor } = await import("apify");
-      const proxyConfig = await Actor.createProxyConfiguration();
-      proxyUrl = await proxyConfig.newUrl();
-    } catch {
-      // not running on Apify or apify not installed
-    }
-  }
-
-  if (proxyUrl) {
-    try {
-      const undici = await import("undici");
-      const { ProxyAgent } = undici;
-      dispatcher = new ProxyAgent(proxyUrl);
-    } catch {
-      // undici not available, fetch will run without proxy
-    }
-  }
-
-  PROXY_CONTEXT = { proxyUrl, dispatcher };
-  return PROXY_CONTEXT;
-}
-
-// ---------- utils ----------
 let lastActivityAt = Date.now();
 
+// ---------- utils ----------
 const b64url = (b) =>
   Buffer.from(b).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const unb64url = (s) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
@@ -109,7 +63,7 @@ function getSelfOrigin(req) {
   return `${proto}://${host}`;
 }
 
-// ---------- URL helpers ----------
+// ---------- HLS helpers ----------
 function toAbsoluteUrl(base, ref) {
   try {
     return new URL(ref).toString();
@@ -117,48 +71,6 @@ function toAbsoluteUrl(base, ref) {
     return new URL(ref, base).toString();
   }
 }
-function looksLikeM3U8(urlObj, contentType) {
-  if (
-    contentType &&
-    /application\/vnd\.apple\.mpegurl|application\/x-mpegURL|audio\/mpegurl/i.test(contentType)
-  )
-    return true;
-  return /\.m3u8($|\?)/i.test(urlObj.pathname);
-}
-function looksDirectMedia(urlStr) {
-  try {
-    const { pathname } = new URL(urlStr);
-    return /\.(mp4|webm|m4v|mov|m3u8)(\?|$)/i.test(pathname);
-  } catch {
-    return false;
-  }
-}
-function isTikTokShort(u) {
-  try {
-    const h = new URL(u).host;
-    return /(^|\.)vm\.tiktok\.com$/i.test(h);
-  } catch {
-    return false;
-  }
-}
-function isTikTokHost(u) {
-  try {
-    const h = new URL(u).host;
-    return /tiktok\.com$/i.test(h);
-  } catch {
-    return false;
-  }
-}
-function isYouTube(u) {
-  try {
-    const host = new URL(u).host.replace(/^www\./, "");
-    return host === "youtube.com" || host === "m.youtube.com" || host === "youtu.be";
-  } catch {
-    return false;
-  }
-}
-
-// ---------- HLS rewrite ----------
 function proxify(selfOrigin, absUrl, ttlSec, headers) {
   const exp = nowSec() + ttlSec;
   const token = signToken({ u: absUrl, exp, h: headers || null });
@@ -181,6 +93,78 @@ function rewriteM3U8(text, sourceUrl, selfOrigin, ttlSec, headers) {
       return proxify(selfOrigin, abs, ttlSec, headers);
     })
     .join("\n");
+}
+function looksLikeM3U8(urlObj, contentType) {
+  if (
+    contentType &&
+    /application\/vnd\.apple\.mpegurl|application\/x-mpegURL|audio\/mpegurl/i.test(contentType)
+  )
+    return true;
+  return /\.m3u8($|\?)/i.test(urlObj.pathname);
+}
+
+// ---------- media detection ----------
+function looksDirectMedia(urlStr) {
+  try {
+    const { pathname } = new URL(urlStr);
+    return /\.(mp4|webm|m4v|mov|m3u8)(\?|$)/i.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+// ---------- yt-dlp ----------
+function ytdlpJson(userUrl) {
+  return new Promise((resolve, reject) => {
+    const args = ["-j", "--no-warnings", "--skip-download", userUrl];
+    const p = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "",
+      err = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (err += d));
+    p.on("close", (code) => {
+      if (code !== 0 || !out.trim()) return reject(new Error(err || `yt-dlp exited ${code}`));
+      try {
+        const lines = out
+          .trim()
+          .split(/\r?\n/)
+          .map((l) => JSON.parse(l));
+        resolve(lines);
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+function pickBest(lines) {
+  const allFormats = lines.flatMap((j) => j.formats || []).filter(Boolean);
+  const hls = allFormats.find(
+    (f) => f && (f.protocol?.includes("m3u8") || /\.m3u8/i.test(f.url || ""))
+  );
+  if (hls)
+    return {
+      url: hls.url,
+      type: "hls",
+      headers: lines[0]?.http_headers || hls.http_headers || null,
+      metaFrom: lines[0],
+    };
+  const best = allFormats.filter((f) => f.url).sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+  if (best)
+    return {
+      url: best.url,
+      type: best.ext || "mp4",
+      headers: lines[0]?.http_headers || best.http_headers || null,
+      metaFrom: lines[0],
+    };
+  const single = lines.find((j) => j.url);
+  if (single)
+    return {
+      url: single.url,
+      type: single.ext || "unknown",
+      headers: single.http_headers || null,
+      metaFrom: single,
+    };
+  return null;
 }
 
 // ---------- header builder ----------
@@ -240,140 +224,6 @@ function buildUpstreamHeaders(baseHeaders, pageOrMediaUrl, canonicalPageUrl) {
   return H;
 }
 
-// ---------- TikTok short link resolver ----------
-async function resolveTikTokShort(inputUrl) {
-  if (!isTikTokShort(inputUrl)) return inputUrl;
-
-  const { dispatcher } = await getProxyContext();
-  let current = inputUrl;
-  for (let i = 0; i < 5; i++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-    let resp;
-    try {
-      resp = await fetch(current, {
-        method: "GET",
-        redirect: "manual",
-        headers: {
-          "User-Agent": UA_TIKTOK,
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        signal: controller.signal,
-        dispatcher,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-
-    const loc = resp.headers.get("location") || resp.headers.get("Location");
-    if (!loc) break;
-
-    // Absolute vs relative
-    if (/^https?:\/\//i.test(loc)) {
-      current = loc;
-    } else {
-      const base = new URL(current);
-      current = new URL(loc, `${base.protocol}//${base.host}`).toString();
-    }
-
-    // stop once it lands on tiktok.com video page
-    if (isTikTokHost(current) && /\/video\//.test(current)) return current;
-  }
-  return current;
-}
-
-// ---------- yt-dlp ----------
-function parseExtraArgs(raw) {
-  if (!raw) return [];
-  // simple split by spaces, no quotes support to keep deps minimal
-  return raw.split(/\s+/).filter(Boolean);
-}
-
-async function ytdlpJson(userUrl, opts = {}) {
-  const { referer = "", ua = "", useCookies = false } = opts;
-
-  const args = ["-j", "--no-warnings", "--skip-download", "--geo-bypass"];
-  // Prefer no playlist expansion when single item intended
-  args.push("--no-playlist");
-
-  // add headers for certain sites
-  const addHeaders = [];
-  if (ua) addHeaders.push(`User-Agent:${ua}`);
-  if (referer) addHeaders.push(`Referer:${referer}`);
-  // also pass Accept to mimic browser better
-  addHeaders.push("Accept:*/*");
-  addHeaders.push("Accept-Language:en-US,en;q=0.5");
-  for (const h of addHeaders) {
-    args.push("--add-header", h);
-  }
-
-  // cookies for YouTube if supplied
-  if (useCookies && YT_COOKIES_PATH) {
-    args.push("--cookies", YT_COOKIES_PATH);
-  }
-
-  // proxy
-  const { proxyUrl } = await getProxyContext();
-  if (proxyUrl) {
-    args.push("--proxy", proxyUrl);
-  }
-
-  // user supplied extras
-  args.push(...parseExtraArgs(YTDLP_ARGS));
-
-  args.push(userUrl);
-
-  return new Promise((resolve, reject) => {
-    const p = spawn(YTDLP_PATH, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "", err = "";
-    p.stdout.on("data", (d) => (out += d));
-    p.stderr.on("data", (d) => (err += d));
-    p.on("close", (code) => {
-      if (code !== 0 || !out.trim()) return reject(new Error(err || `yt-dlp exited ${code}`));
-      try {
-        const lines = out
-          .trim()
-          .split(/\r?\n/)
-          .map((l) => JSON.parse(l));
-        resolve(lines);
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
-}
-
-function pickBest(lines) {
-  const allFormats = lines.flatMap((j) => j.formats || []).filter(Boolean);
-  const hls = allFormats.find(
-    (f) => f && (f.protocol?.includes("m3u8") || /\.m3u8/i.test(f.url || ""))
-  );
-  if (hls)
-    return {
-      url: hls.url,
-      type: "hls",
-      headers: lines[0]?.http_headers || hls.http_headers || null,
-      metaFrom: lines[0],
-    };
-  const best = allFormats.filter((f) => f.url).sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
-  if (best)
-    return {
-      url: best.url,
-      type: best.ext || "mp4",
-      headers: lines[0]?.http_headers || best.http_headers || null,
-      metaFrom: lines[0],
-    };
-  const single = lines.find((j) => j.url);
-  if (single)
-    return {
-      url: single.url,
-      type: single.ext || "unknown",
-      headers: single.http_headers || null,
-      metaFrom: single,
-    };
-  return null;
-}
-
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
   lastActivityAt = Date.now();
@@ -404,34 +254,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // POST /extract
+    // POST /extract -> page or direct, always returns proxy
     if (req.method === "POST" && u.pathname === "/extract") {
       let body = "";
       req.on("data", (d) => (body += d));
       req.on("end", async () => {
-        const startedInner = Date.now();
         try {
-          const { url: rawUrl } = JSON.parse(body || "{}");
-          if (!rawUrl) {
+          const { url: pageUrl } = JSON.parse(body || "{}");
+          if (!pageUrl) {
             res.writeHead(400).end('{"ok":false,"error":"Missing url"}');
             return;
           }
-
-          // resolve TikTok short links before yt-dlp
-          let pageUrl = await resolveTikTokShort(rawUrl);
 
           let mediaUrl = pageUrl;
           let headers = null;
           let metaFrom = null;
 
           if (!looksDirectMedia(pageUrl)) {
-            const useCookies = isYouTube(pageUrl);
-            const ua = isTikTokHost(pageUrl) ? UA_TIKTOK : UA_DEFAULT;
-            const lines = await ytdlpJson(pageUrl, {
-              referer: pageUrl,
-              ua,
-              useCookies,
-            });
+            const lines = await ytdlpJson(pageUrl);
             const best = pickBest(lines);
             if (!best) {
               res.writeHead(404).end(JSON.stringify({ ok: false, error: "No playable URL" }));
@@ -469,13 +309,13 @@ const server = http.createServer(async (req, res) => {
             .writeHead(502, { "Content-Type": "application/json" })
             .end(JSON.stringify({ ok: false, error: String(e) }));
         } finally {
-          console.log(`[END] /extract in ${Date.now() - startedInner}ms`);
+          console.log(`[END] /extract in ${Date.now() - started}ms`);
         }
       });
       return;
     }
 
-    // GET /sign?u=...
+    // GET /sign?u=... -> universal: page or direct, always returns proxy
     if (req.method === "GET" && u.pathname === "/sign") {
       const input = u.searchParams.get("u");
       if (!input) {
@@ -492,21 +332,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        // resolve TikTok short link first
-        let pageUrl = await resolveTikTokShort(abs);
-
-        let mediaUrl = pageUrl;
+        let mediaUrl = abs;
         let headers = null;
         let metaFrom = null;
 
-        if (!looksDirectMedia(pageUrl)) {
-          const useCookies = isYouTube(pageUrl);
-          const ua = isTikTokHost(pageUrl) ? UA_TIKTOK : UA_DEFAULT;
-          const lines = await ytdlpJson(pageUrl, {
-            referer: pageUrl,
-            ua,
-            useCookies,
-          });
+        if (!looksDirectMedia(abs)) {
+          const lines = await ytdlpJson(abs);
           const best = pickBest(lines);
           if (!best) {
             res.writeHead(404).end(JSON.stringify({ ok: false, error: "No playable URL" }));
@@ -517,7 +348,7 @@ const server = http.createServer(async (req, res) => {
           metaFrom = best.metaFrom || null;
         }
 
-        const canonical = metaFrom?.webpage_url || pageUrl;
+        const canonical = metaFrom?.webpage_url || abs;
         const upstreamHeaders = buildUpstreamHeaders(headers, mediaUrl, canonical);
 
         const expiresAt = nowSec() + TOKEN_TTL_SEC;
@@ -593,7 +424,6 @@ const server = http.createServer(async (req, res) => {
       const reqHeaders = { ...(range ? { Range: range } : {}), ...h };
 
       const controller = new AbortController();
-      const { dispatcher } = await getProxyContext();
       const t = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 
       let upstream;
@@ -603,7 +433,6 @@ const server = http.createServer(async (req, res) => {
           redirect: "follow",
           headers: reqHeaders,
           signal: controller.signal,
-          dispatcher,
         });
       } catch (err) {
         clearTimeout(t);
@@ -617,7 +446,10 @@ const server = http.createServer(async (req, res) => {
       let ct = upstream.headers.get("content-type") || "";
 
       // Retry once for TikTok if HTML or not ok
-      if ((!upstream.ok || /^text\/html/i.test(ct)) && upstreamUrl.host.includes("tiktok")) {
+      if (
+        (!upstream.ok || /^text\/html/i.test(ct)) &&
+        upstreamUrl.host.includes("tiktok")
+      ) {
         const retryHeaders = {
           ...reqHeaders,
           "User-Agent": UA_TIKTOK,
@@ -632,13 +464,15 @@ const server = http.createServer(async (req, res) => {
           redirect: "follow",
           headers: retryHeaders,
           signal: controller.signal,
-          dispatcher,
         });
 
         ct = upstream.headers.get("content-type") || "";
       }
 
-      if (!upstream.ok && !/^(video|application\/vnd\.apple\.mpegurl|application\/x-mpegURL)/i.test(ct)) {
+      if (
+        !upstream.ok &&
+        !/^(video|application\/vnd\.apple\.mpegurl|application\/x-mpegURL)/i.test(ct)
+      ) {
         console.log("[UPSTREAM]", upstream.status, ct, "URL:", upstreamUrl.toString());
       }
 
