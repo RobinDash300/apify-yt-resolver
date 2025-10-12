@@ -3,14 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
-    "apify": "^3.2.0",
-    "undici": "^6.0.0"
-  },
-  "scripts": {
-    "start": "node server.mjs"
+    "express": "^4.19.2",
+    "morgan": "^1.10.0"
   }
 }
