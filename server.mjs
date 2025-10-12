@@ -165,6 +165,59 @@ function pickBest(lines) {
   return null;
 }
 
+// ---------- header builder ----------
+const CANON = {
+  "user-agent": "User-Agent",
+  referer: "Referer",
+  origin: "Origin",
+  cookie: "Cookie",
+  accept: "Accept",
+  "accept-language": "Accept-Language",
+  "sec-fetch-mode": "Sec-Fetch-Mode",
+  "sec-fetch-site": "Sec-Fetch-Site",
+  "sec-fetch-dest": "Sec-Fetch-Dest",
+};
+const ALLOW_SET = new Set(Object.keys(CANON));
+
+function buildUpstreamHeaders(baseHeaders, pageUrlOrAbs) {
+  const H = {};
+  const src = baseHeaders || {};
+
+  // copy only allowed, normalize case
+  for (const [k, v] of Object.entries(src)) {
+    if (!v) continue;
+    const lower = k.toLowerCase();
+    if (ALLOW_SET.has(lower)) H[CANON[lower]] = v;
+  }
+
+  // defaults
+  if (!H["User-Agent"]) H["User-Agent"] = UA_DEFAULT;
+
+  try {
+    const host = new URL(pageUrlOrAbs).host || "";
+    if (host.includes("tiktok")) {
+      if (!H["Referer"]) H["Referer"] = "https://www.tiktok.com/";
+      if (!H["Origin"]) H["Origin"] = "https://www.tiktok.com";
+    } else {
+      if (!H["Origin"] && H["Referer"]) {
+        try {
+          H["Origin"] = new URL(H["Referer"]).origin;
+        } catch {}
+      }
+      if (!H["Origin"]) {
+        try {
+          H["Origin"] = new URL(pageUrlOrAbs).origin;
+        } catch {}
+      }
+    }
+  } catch {}
+
+  if (!H["Accept"]) H["Accept"] = "*/*";
+  if (!H["Accept-Language"]) H["Accept-Language"] = "en-US,en;q=0.5";
+
+  return H;
+}
+
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
   lastActivityAt = Date.now();
@@ -175,7 +228,7 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`[REQ] ${req.method} ${u.pathname}${u.search || ""}`);
 
-  // standby readiness
+  // readiness for Standby
   if (req.headers["x-apify-container-server-readiness-probe"]) {
     res.writeHead(200, { "Content-Type": "text/plain" }).end("OK");
     return;
@@ -198,7 +251,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // POST /extract -> always proxy (page URL or direct URL)
+    // POST /extract -> accepts page or direct, always returns proxy
     if (req.method === "POST" && u.pathname === "/extract") {
       let body = "";
       req.on("data", (d) => (body += d));
@@ -226,18 +279,7 @@ const server = http.createServer(async (req, res) => {
             metaFrom = best.metaFrom || null;
           }
 
-          // default headers and TikTok referer hardening
-          const upstreamHeaders = headers ? { ...headers } : {};
-          if (!upstreamHeaders["User-Agent"]) upstreamHeaders["User-Agent"] = UA_DEFAULT;
-          if (!upstreamHeaders["Referer"]) {
-            try {
-              const host = new URL(pageUrl).host || "";
-              if (host.includes("tiktok")) upstreamHeaders["Referer"] = "https://www.tiktok.com/";
-              else upstreamHeaders["Referer"] = new URL(pageUrl).origin;
-            } catch {
-              // ignore
-            }
-          }
+          const upstreamHeaders = buildUpstreamHeaders(headers, pageUrl);
 
           const meta = metaFrom
             ? {
@@ -269,7 +311,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // GET /sign?u=... -> now universal: accepts page or direct, always returns proxy
+    // GET /sign?u=... -> universal: page or direct, always returns proxy
     if (req.method === "GET" && u.pathname === "/sign") {
       const input = u.searchParams.get("u");
       if (!input) {
@@ -302,18 +344,7 @@ const server = http.createServer(async (req, res) => {
           metaFrom = best.metaFrom || null;
         }
 
-        // default headers and TikTok referer hardening
-        const upstreamHeaders = headers ? { ...headers } : {};
-        if (!upstreamHeaders["User-Agent"]) upstreamHeaders["User-Agent"] = UA_DEFAULT;
-        if (!upstreamHeaders["Referer"]) {
-          try {
-            const host = new URL(abs).host || "";
-            if (host.includes("tiktok")) upstreamHeaders["Referer"] = "https://www.tiktok.com/";
-            else upstreamHeaders["Referer"] = new URL(abs).origin;
-          } catch {
-            // ignore
-          }
-        }
+        const upstreamHeaders = buildUpstreamHeaders(headers, abs);
 
         const expiresAt = nowSec() + TOKEN_TTL_SEC;
         const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders });
@@ -353,9 +384,27 @@ const server = http.createServer(async (req, res) => {
       const range = req.headers.range;
       const ua = req.headers["user-agent"] || UA_DEFAULT;
 
-      const h = { "User-Agent": ua };
-      if (payload.h?.["Referer"]) h["Referer"] = payload.h["Referer"];
-      if (payload.h?.["Cookie"]) h["Cookie"] = payload.h["Cookie"];
+      // build forwarded headers, prefer ones in the signed payload
+      const h = {};
+      h["User-Agent"] =
+        (payload.h && (payload.h["User-Agent"] || payload.h["user-agent"])) || ua;
+
+      const COPY = [
+        "Referer",
+        "Origin",
+        "Cookie",
+        "Accept",
+        "Accept-Language",
+        "Sec-Fetch-Mode",
+        "Sec-Fetch-Site",
+        "Sec-Fetch-Dest",
+      ];
+      for (const name of COPY) {
+        const v = payload.h?.[name] ?? payload.h?.[name.toLowerCase()];
+        if (v) h[name] = v;
+      }
+
+      const reqHeaders = { ...(range ? { Range: range } : {}), ...h };
 
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
@@ -363,9 +412,9 @@ const server = http.createServer(async (req, res) => {
       let upstream;
       try {
         upstream = await fetch(upstreamUrl.toString(), {
-          method: req.method, // GET or HEAD
+          method: req.method,
           redirect: "follow",
-          headers: { ...(range ? { Range: range } : {}), ...h },
+          headers: reqHeaders,
           signal: controller.signal,
         });
       } catch (err) {
@@ -378,8 +427,14 @@ const server = http.createServer(async (req, res) => {
       }
 
       const ct = upstream.headers.get("content-type") || "";
+      if (
+        !upstream.ok &&
+        !/^(video|application\/vnd\.apple\.mpegurl|application\/x-mpegURL)/i.test(ct)
+      ) {
+        console.log("[UPSTREAM]", upstream.status, ct, "URL:", upstreamUrl.toString());
+      }
 
-      // If HLS, rewrite playlist so nested URIs also go through our proxy
+      // HLS playlist rewrite
       if (req.method === "GET" && looksLikeM3U8(upstreamUrl, ct)) {
         const manifest = await upstream.text();
         const rewritten = rewriteM3U8(
