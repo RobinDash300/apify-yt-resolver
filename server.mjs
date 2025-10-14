@@ -15,6 +15,7 @@ const UA_DEFAULT =
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000", 10);
 const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10);
 const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
+const HLS_TOKEN_TTL_SEC = parseInt(process.env.HLS_TOKEN_TTL_SEC || "1800", 10);
 
 let lastActivityAt = Date.now();
 
@@ -53,7 +54,6 @@ function cors(res) {
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   res.setHeader("Timing-Allow-Origin", CORS_ALLOW);
   res.setHeader("Vary", "Origin, Range");
-  res.setHeader("Connection", "close");
 }
 function getSelfOrigin(req) {
   const proto = req.headers["x-forwarded-proto"] || "http";
@@ -114,7 +114,29 @@ function looksDirectMedia(urlStr) {
 // ---------- yt-dlp ----------
 function ytdlpJson(userUrl) {
   return new Promise((resolve, reject) => {
-    const args = ["-j", "--no-warnings", "--skip-download", userUrl];
+    // Add UA + Referer to improve extraction reliability from DC IPs
+    let referer = "";
+    try {
+      const u = new URL(userUrl);
+      referer = u.origin;
+      if (u.host.includes("tiktok")) referer = "https://www.tiktok.com/";
+      if (u.host.includes("youtube.") || u.host.includes("youtu.be")) referer = "https://www.youtube.com/";
+      if (u.host.includes("reddit.")) referer = "https://www.reddit.com/";
+    } catch {}
+
+    const args = [
+      "-j",
+      "--no-warnings",
+      "--skip-download",
+      "--no-call-home",
+      "--geo-bypass",
+      "--user-agent",
+      UA_DEFAULT,
+      "--add-header",
+      `Referer:${referer || userUrl}`,
+      userUrl,
+    ];
+
     const p = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
     let out = "",
       err = "";
@@ -134,26 +156,57 @@ function ytdlpJson(userUrl) {
     });
   });
 }
+
+// Prefer HLS master or progressive (audio+video) over video-only DASH
 function pickBest(lines) {
   const allFormats = lines.flatMap((j) => j.formats || []).filter(Boolean);
-  const hls = allFormats.find(
-    (f) => f && (f.protocol?.includes("m3u8") || /\.m3u8/i.test(f.url || ""))
-  );
-  if (hls)
+
+  const hasAudio = (f) => !f || f.acodec === undefined || (f.acodec && f.acodec !== "none");
+  const isHls = (f) =>
+    f && (f.protocol?.includes("m3u8") || /\.m3u8/i.test(f.url || "") || f.manifest_url);
+
+  // 1) Prefer HLS master (tends to be A+V and browser-friendly)
+  const hls = allFormats.find((f) => isHls(f));
+  if (hls) {
     return {
-      url: hls.url,
+      url: hls.url || hls.manifest_url,
       type: "hls",
       headers: lines[0]?.http_headers || hls.http_headers || null,
       metaFrom: lines[0],
     };
-  const best = allFormats.filter((f) => f.url).sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
-  if (best)
+  }
+
+  // 2) Prefer progressive with audio (ext mp4/webm and acodec != none)
+  const progressiveAV = allFormats
+    .filter(
+      (f) =>
+        f.url &&
+        hasAudio(f) &&
+        (/(mp4|webm)$/i.test(f.ext || "") || /(mp4|webm)/i.test(f.container || "")) &&
+        !/dash|segment/i.test(f.protocol || "")
+    )
+    .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+  if (progressiveAV) {
     return {
-      url: best.url,
-      type: best.ext || "mp4",
-      headers: lines[0]?.http_headers || best.http_headers || null,
+      url: progressiveAV.url,
+      type: progressiveAV.ext || "mp4",
+      headers: lines[0]?.http_headers || progressiveAV.http_headers || null,
       metaFrom: lines[0],
     };
+  }
+
+  // 3) Fall back to any http(s) URL (may be video-only)
+  const bestAny = allFormats.filter((f) => f.url).sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+  if (bestAny) {
+    return {
+      url: bestAny.url,
+      type: bestAny.ext || "unknown",
+      headers: lines[0]?.http_headers || bestAny.http_headers || null,
+      metaFrom: lines[0],
+    };
+  }
+
+  // 4) Single URL on the root (rare)
   const single = lines.find((j) => j.url);
   if (single)
     return {
@@ -162,7 +215,71 @@ function pickBest(lines) {
       headers: single.http_headers || null,
       metaFrom: single,
     };
+
   return null;
+}
+
+// ---------- robust upstream fetch (GET even for HEAD) ----------
+async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1) {
+  let attempt = 0;
+  let lastErr;
+  while (attempt <= maxRetries) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+    try {
+      const resp = await fetch(urlStr, {
+        ...opts,
+        method: "GET",
+        signal: controller.signal,
+        redirect: "follow",
+      });
+      clearTimeout(timeout);
+
+      if (!resp.ok && resp.status >= 500 && attempt < maxRetries) {
+        attempt++;
+        lastErr = new Error(`Upstream ${resp.status}`);
+        continue;
+      }
+
+      if (resp.body && inactivityMs > 0) {
+        const reader = resp.body.getReader();
+        let inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
+
+        const stream = new Readable({ read() {} });
+
+        (async () => {
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              lastActivityAt = Date.now();
+              clearTimeout(inactivityTimer);
+              inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
+              stream.push(Buffer.from(value));
+            }
+            clearTimeout(inactivityTimer);
+            stream.push(null);
+          } catch (e) {
+            clearTimeout(inactivityTimer);
+            stream.destroy(e);
+          }
+        })();
+
+        return { resp, nodeStream: stream, usedGetForHead: opts.method === "HEAD" };
+      }
+
+      return { resp, nodeStream: null, usedGetForHead: opts.method === "HEAD" };
+    } catch (e) {
+      clearTimeout(timeout);
+      lastErr = e;
+      if (attempt < maxRetries) {
+        attempt++;
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr || new Error("Unknown upstream error");
 }
 
 // ---------- server ----------
@@ -234,9 +351,7 @@ const server = http.createServer(async (req, res) => {
               const host = new URL(pageUrl).host || "";
               if (host.includes("tiktok")) upstreamHeaders["Referer"] = "https://www.tiktok.com/";
               else upstreamHeaders["Referer"] = new URL(pageUrl).origin;
-            } catch {
-              // ignore
-            }
+            } catch {}
           }
 
           const meta = metaFrom
@@ -269,7 +384,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // GET /sign?u=... -> now universal: accepts page or direct, always returns proxy
+    // GET /sign?u=... -> universal: accepts page or direct, always returns proxy
     if (req.method === "GET" && u.pathname === "/sign") {
       const input = u.searchParams.get("u");
       if (!input) {
@@ -302,7 +417,6 @@ const server = http.createServer(async (req, res) => {
           metaFrom = best.metaFrom || null;
         }
 
-        // default headers and TikTok referer hardening
         const upstreamHeaders = headers ? { ...headers } : {};
         if (!upstreamHeaders["User-Agent"]) upstreamHeaders["User-Agent"] = UA_DEFAULT;
         if (!upstreamHeaders["Referer"]) {
@@ -310,9 +424,7 @@ const server = http.createServer(async (req, res) => {
             const host = new URL(abs).host || "";
             if (host.includes("tiktok")) upstreamHeaders["Referer"] = "https://www.tiktok.com/";
             else upstreamHeaders["Referer"] = new URL(abs).origin;
-          } catch {
-            // ignore
-          }
+          } catch {}
         }
 
         const expiresAt = nowSec() + TOKEN_TTL_SEC;
@@ -353,40 +465,43 @@ const server = http.createServer(async (req, res) => {
       const range = req.headers.range;
       const ua = req.headers["user-agent"] || UA_DEFAULT;
 
-      const h = { "User-Agent": ua };
+      const h = {
+        "User-Agent": ua,
+        Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.8",
+      };
       if (payload.h?.["Referer"]) h["Referer"] = payload.h["Referer"];
       if (payload.h?.["Cookie"]) h["Cookie"] = payload.h["Cookie"];
-
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+      if (range) h["Range"] = range;
+      // forwarding Origin helps some CDNs (safe for GET)
+      if (req.headers.origin) h["Origin"] = req.headers.origin;
 
       let upstream;
       try {
-        upstream = await fetch(upstreamUrl.toString(), {
-          method: req.method, // GET or HEAD
-          redirect: "follow",
-          headers: { ...(range ? { Range: range } : {}), ...h },
-          signal: controller.signal,
-        });
+        upstream = await fetchUpstreamWithRetry(
+          upstreamUrl.toString(),
+          { method: req.method, headers: h },
+          Math.max(UPSTREAM_TIMEOUT_MS / 2, 8000),
+          1
+        );
       } catch (err) {
-        clearTimeout(t);
         console.error("fetch upstream failed:", err);
         res.writeHead(502).end("Upstream fetch failed");
         return;
-      } finally {
-        clearTimeout(t);
       }
 
-      const ct = upstream.headers.get("content-type") || "";
+      const resp = upstream.resp;
+      const ct = resp.headers.get("content-type") || "";
 
-      // If HLS, rewrite playlist so nested URIs also go through our proxy
       if (req.method === "GET" && looksLikeM3U8(upstreamUrl, ct)) {
-        const manifest = await upstream.text();
+        const manifest = upstream.nodeStream
+          ? await streamToString(upstream.nodeStream)
+          : await resp.text();
         const rewritten = rewriteM3U8(
           manifest,
           upstreamUrl,
           selfOrigin,
-          TOKEN_TTL_SEC,
+          HLS_TOKEN_TTL_SEC,
           payload.h || null
         );
         res.setHeader("Cache-Control", "no-store");
@@ -397,19 +512,20 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // pass through headers needed for playback and canvas
-      const acceptRanges = upstream.headers.get("accept-ranges");
-      const contentRange = upstream.headers.get("content-range");
-      const contentLength = upstream.headers.get("content-length");
-      const contentType = upstream.headers.get("content-type");
+      const acceptRanges = resp.headers.get("accept-ranges");
+      const contentRange = resp.headers.get("content-range");
+      const contentLength = resp.headers.get("content-length");
+      const contentType = resp.headers.get("content-type");
 
       if (acceptRanges) res.setHeader("Accept-Ranges", acceptRanges);
+      else if (range) res.setHeader("Accept-Ranges", "bytes");
+
       if (contentRange) res.setHeader("Content-Range", contentRange);
       if (contentLength) res.setHeader("Content-Length", contentLength);
       if (contentType) res.setHeader("Content-Type", contentType);
       if (!res.getHeader("Cache-Control")) res.setHeader("Cache-Control", "no-store");
 
-      res.writeHead(upstream.status);
+      res.writeHead(resp.status);
 
       if (req.method === "HEAD") {
         res.end();
@@ -418,11 +534,17 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        if (upstream.body) {
-          const nodeReadable = Readable.fromWeb(upstream.body);
-          nodeReadable.on("data", () => {
-            lastActivityAt = Date.now();
+        if (upstream.nodeStream) {
+          upstream.nodeStream.on("data", () => (lastActivityAt = Date.now()));
+          upstream.nodeStream.on("error", () => {
+            try {
+              res.end();
+            } catch {}
           });
+          upstream.nodeStream.pipe(res);
+        } else if (resp.body) {
+          const nodeReadable = Readable.fromWeb(resp.body);
+          nodeReadable.on("data", () => (lastActivityAt = Date.now()));
           nodeReadable.on("error", () => {
             try {
               res.end();
@@ -452,6 +574,17 @@ const server = http.createServer(async (req, res) => {
     } catch {}
   }
 });
+
+// Helper for reading a stream into string (used for m3u8 rewrite)
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk) => (data += chunk));
+    stream.on("end", () => resolve(data));
+    stream.on("error", reject);
+  });
+}
 
 // ---------- server tune ----------
 server.keepAliveTimeout = 5000;
