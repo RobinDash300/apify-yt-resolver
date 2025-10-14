@@ -13,6 +13,10 @@ const CORS_ALLOW = process.env.CORS_ALLOW || "*";
 const UA_DEFAULT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000", 10);
+const UPSTREAM_INACTIVITY_MS_RAW = process.env.UPSTREAM_INACTIVITY_MS;
+const UPSTREAM_INACTIVITY_MS = Number.isFinite(Number(UPSTREAM_INACTIVITY_MS_RAW))
+  ? Math.max(parseInt(UPSTREAM_INACTIVITY_MS_RAW, 10) || 0, 0)
+  : Math.max(Math.floor(UPSTREAM_TIMEOUT_MS / 2), 8000);
 const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10);
 const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
 const HLS_TOKEN_TTL_SEC = parseInt(process.env.HLS_TOKEN_TTL_SEC || "1800", 10);
@@ -241,34 +245,38 @@ async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1
         continue;
       }
 
-      if (resp.body && inactivityMs > 0) {
-        const reader = resp.body.getReader();
-        let inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
+      let nodeStream = null;
 
-        const stream = new Readable({ read() {} });
+      if (resp.body) {
+        if (inactivityMs > 0) {
+          const reader = resp.body.getReader();
+          let inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
 
-        (async () => {
-          try {
-            for (;;) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              lastActivityAt = Date.now();
+          nodeStream = new Readable({ read() {} });
+
+          (async () => {
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                lastActivityAt = Date.now();
+                clearTimeout(inactivityTimer);
+                inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
+                nodeStream.push(Buffer.from(value));
+              }
               clearTimeout(inactivityTimer);
-              inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
-              stream.push(Buffer.from(value));
+              nodeStream.push(null);
+            } catch (e) {
+              clearTimeout(inactivityTimer);
+              nodeStream.destroy(e);
             }
-            clearTimeout(inactivityTimer);
-            stream.push(null);
-          } catch (e) {
-            clearTimeout(inactivityTimer);
-            stream.destroy(e);
-          }
-        })();
-
-        return { resp, nodeStream: stream, usedGetForHead: opts.method === "HEAD" };
+          })();
+        } else {
+          nodeStream = Readable.fromWeb(resp.body);
+        }
       }
 
-      return { resp, nodeStream: null, usedGetForHead: opts.method === "HEAD" };
+      return { resp, nodeStream, usedGetForHead: opts.method === "HEAD" };
     } catch (e) {
       clearTimeout(timeout);
       lastErr = e;
@@ -481,7 +489,7 @@ const server = http.createServer(async (req, res) => {
         upstream = await fetchUpstreamWithRetry(
           upstreamUrl.toString(),
           { method: req.method, headers: h },
-          Math.max(UPSTREAM_TIMEOUT_MS / 2, 8000),
+          UPSTREAM_INACTIVITY_MS,
           1
         );
       } catch (err) {
