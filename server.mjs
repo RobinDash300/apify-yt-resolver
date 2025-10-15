@@ -13,17 +13,97 @@ const CORS_ALLOW = process.env.CORS_ALLOW || "*";
 const UA_DEFAULT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000", 10);
+const UPSTREAM_INACTIVITY_MS_RAW = process.env.UPSTREAM_INACTIVITY_MS;
+const UPSTREAM_INACTIVITY_MS = Number.isFinite(Number(UPSTREAM_INACTIVITY_MS_RAW))
+  ? Math.max(parseInt(UPSTREAM_INACTIVITY_MS_RAW, 10) || 0, 0)
+  : Math.max(Math.floor(UPSTREAM_TIMEOUT_MS / 2), 8000);
 const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10);
 const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
 const HLS_TOKEN_TTL_SEC = parseInt(process.env.HLS_TOKEN_TTL_SEC || "1800", 10);
 
 let lastActivityAt = Date.now();
+let activeRequests = 0;
+let exitTimer = null;
 
 // ---------- utils ----------
 const b64url = (b) =>
   Buffer.from(b).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const unb64url = (s) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 const nowSec = () => Math.floor(Date.now() / 1000);
+
+function truncateString(value, max = 400) {
+  if (typeof value !== "string") return value;
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
+function logEvent(level, scope, meta = {}) {
+  const printable = {};
+  for (const [key, val] of Object.entries(meta)) {
+    if (val === undefined) continue;
+    if (val instanceof Error) printable[key] = val.message;
+    else if (typeof val === "object" && val !== null) {
+      try {
+        printable[key] = JSON.parse(JSON.stringify(val));
+      } catch {
+        printable[key] = String(val);
+      }
+    } else {
+      printable[key] = val;
+    }
+  }
+  const serialized = Object.keys(printable).length ? ` ${JSON.stringify(printable)}` : "";
+  const writer = typeof console[level] === "function" ? console[level].bind(console) : console.log.bind(console);
+  writer(`[${level.toUpperCase()}] ${scope}${serialized}`);
+}
+
+function logError(scope, error, meta = {}) {
+  const message = error?.message || String(error);
+  logEvent("error", scope, { ...meta, error: message });
+  if (error?.stack) console.error(error.stack);
+}
+
+function scheduleExitCheck() {
+  if (AUTO_EXIT_IDLE_MS <= 0) return;
+  if (exitTimer) clearTimeout(exitTimer);
+  exitTimer = setTimeout(() => {
+    exitTimer = null;
+    if (activeRequests > 0) {
+      scheduleExitCheck();
+      return;
+    }
+    const idle = Date.now() - lastActivityAt;
+    if (idle >= AUTO_EXIT_IDLE_MS) {
+      console.log(`[EXIT] idle ${idle}ms >= ${AUTO_EXIT_IDLE_MS}ms, exiting`);
+      setTimeout(() => process.exit(0), 200);
+    } else {
+      scheduleExitCheck();
+    }
+  }, AUTO_EXIT_IDLE_MS);
+  if (typeof exitTimer.unref === "function") exitTimer.unref();
+}
+
+function noteActivity() {
+  lastActivityAt = Date.now();
+  scheduleExitCheck();
+}
+
+function trackActiveRequest(res) {
+  activeRequests += 1;
+  let released = false;
+
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeRequests = Math.max(0, activeRequests - 1);
+    noteActivity();
+  };
+
+  res.on("close", release);
+  res.on("finish", release);
+  res.on("error", release);
+
+  return release;
+}
 
 function signToken(payloadObj) {
   const body = b64url(JSON.stringify(payloadObj));
@@ -69,12 +149,12 @@ function toAbsoluteUrl(base, ref) {
     return new URL(ref, base).toString();
   }
 }
-function proxify(selfOrigin, absUrl, ttlSec, headers) {
+function proxify(selfOrigin, absUrl, ttlSec, headers, sourceUrl) {
   const exp = nowSec() + ttlSec;
-  const token = signToken({ u: absUrl, exp, h: headers || null });
+  const token = signToken({ u: absUrl, exp, h: headers || null, src: sourceUrl || null });
   return `${selfOrigin}/proxy?${PROXY_PARAM}=${encodeURIComponent(token)}`;
 }
-function rewriteM3U8(text, sourceUrl, selfOrigin, ttlSec, headers) {
+function rewriteM3U8(text, sourceUrl, selfOrigin, ttlSec, headers, originalUrl) {
   const lines = text.split(/\r?\n/);
   return lines
     .map((line) => {
@@ -82,13 +162,13 @@ function rewriteM3U8(text, sourceUrl, selfOrigin, ttlSec, headers) {
         if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP")) {
           return line.replace(/URI="([^"]+)"/, (_m, uriVal) => {
             const abs = toAbsoluteUrl(sourceUrl, uriVal);
-            return `URI="${proxify(selfOrigin, abs, ttlSec, headers)}"`;
+            return `URI="${proxify(selfOrigin, abs, ttlSec, headers, originalUrl)}"`;
           });
         }
         return line;
       }
       const abs = toAbsoluteUrl(sourceUrl, line.trim());
-      return proxify(selfOrigin, abs, ttlSec, headers);
+      return proxify(selfOrigin, abs, ttlSec, headers, originalUrl);
     })
     .join("\n");
 }
@@ -241,34 +321,38 @@ async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1
         continue;
       }
 
-      if (resp.body && inactivityMs > 0) {
-        const reader = resp.body.getReader();
-        let inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
+      let nodeStream = null;
 
-        const stream = new Readable({ read() {} });
+      if (resp.body) {
+        if (inactivityMs > 0) {
+          const reader = resp.body.getReader();
+          let inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
 
-        (async () => {
-          try {
-            for (;;) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              lastActivityAt = Date.now();
+          nodeStream = new Readable({ read() {} });
+
+          (async () => {
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                noteActivity();
+                clearTimeout(inactivityTimer);
+                inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
+                nodeStream.push(Buffer.from(value));
+              }
               clearTimeout(inactivityTimer);
-              inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
-              stream.push(Buffer.from(value));
+              nodeStream.push(null);
+            } catch (e) {
+              clearTimeout(inactivityTimer);
+              nodeStream.destroy(e);
             }
-            clearTimeout(inactivityTimer);
-            stream.push(null);
-          } catch (e) {
-            clearTimeout(inactivityTimer);
-            stream.destroy(e);
-          }
-        })();
-
-        return { resp, nodeStream: stream, usedGetForHead: opts.method === "HEAD" };
+          })();
+        } else {
+          nodeStream = Readable.fromWeb(resp.body);
+        }
       }
 
-      return { resp, nodeStream: null, usedGetForHead: opts.method === "HEAD" };
+      return { resp, nodeStream, usedGetForHead: opts.method === "HEAD" };
     } catch (e) {
       clearTimeout(timeout);
       lastErr = e;
@@ -284,7 +368,8 @@ async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1
 
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
-  lastActivityAt = Date.now();
+  noteActivity();
+  trackActiveRequest(res);
   const started = Date.now();
   const selfOrigin = getSelfOrigin(req);
   const u = new URL(req.url, `${selfOrigin}`);
@@ -320,12 +405,24 @@ const server = http.createServer(async (req, res) => {
       let body = "";
       req.on("data", (d) => (body += d));
       req.on("end", async () => {
+        const requestStarted = Date.now();
+        let pageUrl;
         try {
-          const { url: pageUrl } = JSON.parse(body || "{}");
+          try {
+            ({ url: pageUrl } = JSON.parse(body || "{}"));
+          } catch (parseErr) {
+            logError("extract.parse", parseErr, { rawBody: truncateString(body, 200) });
+            res.writeHead(400).end('{"ok":false,"error":"Invalid JSON"}');
+            return;
+          }
+
           if (!pageUrl) {
+            logEvent("warn", "extract.missingUrl", {});
             res.writeHead(400).end('{"ok":false,"error":"Missing url"}');
             return;
           }
+
+          logEvent("info", "extract.received", { userUrl: truncateString(pageUrl, 500) });
 
           let mediaUrl = pageUrl;
           let headers = null;
@@ -335,6 +432,7 @@ const server = http.createServer(async (req, res) => {
             const lines = await ytdlpJson(pageUrl);
             const best = pickBest(lines);
             if (!best) {
+              logEvent("warn", "extract.noPlayable", { userUrl: truncateString(pageUrl, 500) });
               res.writeHead(404).end(JSON.stringify({ ok: false, error: "No playable URL" }));
               return;
             }
@@ -366,19 +464,27 @@ const server = http.createServer(async (req, res) => {
             : null;
 
           const expiresAt = nowSec() + TOKEN_TTL_SEC;
-          const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders });
+          const signed = signToken({
+            u: mediaUrl,
+            exp: expiresAt,
+            h: upstreamHeaders,
+            src: pageUrl,
+          });
           const proxyUrl = `${selfOrigin}/proxy?${PROXY_PARAM}=${encodeURIComponent(signed)}`;
 
           res
             .writeHead(200, { "Content-Type": "application/json" })
             .end(JSON.stringify({ ok: true, mode: "proxy", type: "auto", proxyUrl, expiresAt, meta }));
         } catch (e) {
-          console.error("extract error:", e);
+          logError("extract.handler", e, { userUrl: truncateString(pageUrl, 500) });
           res
             .writeHead(502, { "Content-Type": "application/json" })
             .end(JSON.stringify({ ok: false, error: String(e) }));
         } finally {
-          console.log(`[END] /extract in ${Date.now() - started}ms`);
+          logEvent("info", "extract.complete", {
+            userUrl: pageUrl ? truncateString(pageUrl, 500) : null,
+            durationMs: Date.now() - requestStarted,
+          });
         }
       });
       return;
@@ -388,6 +494,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && u.pathname === "/sign") {
       const input = u.searchParams.get("u");
       if (!input) {
+        logEvent("warn", "sign.missingParam", {});
         res.writeHead(400).end('{"ok":false,"error":"Missing u"}');
         return;
       }
@@ -396,25 +503,28 @@ const server = http.createServer(async (req, res) => {
       try {
         abs = new URL(input).toString();
       } catch {
+        logEvent("warn", "sign.badUrl", { input: truncateString(input, 500) });
         res.writeHead(400).end('{"ok":false,"error":"Bad URL"}');
         return;
       }
 
+      const requestStarted = Date.now();
       try {
+        logEvent("info", "sign.received", { userUrl: truncateString(abs, 500) });
+
         let mediaUrl = abs;
         let headers = null;
-        let metaFrom = null;
 
         if (!looksDirectMedia(abs)) {
           const lines = await ytdlpJson(abs);
           const best = pickBest(lines);
           if (!best) {
+            logEvent("warn", "sign.noPlayable", { userUrl: truncateString(abs, 500) });
             res.writeHead(404).end(JSON.stringify({ ok: false, error: "No playable URL" }));
             return;
           }
           mediaUrl = best.url;
           headers = best.headers || null;
-          metaFrom = best.metaFrom || null;
         }
 
         const upstreamHeaders = headers ? { ...headers } : {};
@@ -428,20 +538,28 @@ const server = http.createServer(async (req, res) => {
         }
 
         const expiresAt = nowSec() + TOKEN_TTL_SEC;
-        const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders });
+        const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders, src: abs });
         const proxyUrl = `${selfOrigin}/proxy?${PROXY_PARAM}=${encodeURIComponent(signed)}`;
 
         res
           .writeHead(200, { "Content-Type": "application/json" })
           .end(JSON.stringify({ ok: true, proxyUrl, expiresAt }));
-        console.log(`[END] /sign -> proxy in ${Date.now() - started}ms`);
+        logEvent("info", "sign.success", {
+          userUrl: truncateString(abs, 500),
+          durationMs: Date.now() - requestStarted,
+        });
         return;
       } catch (e) {
-        console.error("sign error:", e);
+        logError("sign.handler", e, { userUrl: truncateString(abs, 500) });
         res
           .writeHead(502, { "Content-Type": "application/json" })
           .end(JSON.stringify({ ok: false, error: String(e) }));
         return;
+      } finally {
+        logEvent("info", "sign.complete", {
+          userUrl: truncateString(abs, 500),
+          durationMs: Date.now() - requestStarted,
+        });
       }
     }
 
@@ -449,6 +567,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.method === "GET" || req.method === "HEAD") && u.pathname === "/proxy") {
       const signed = u.searchParams.get(PROXY_PARAM);
       if (!signed) {
+        logEvent("warn", "proxy.missingSignature", {});
         res.writeHead(400).end("Missing signature");
         return;
       }
@@ -456,14 +575,24 @@ const server = http.createServer(async (req, res) => {
       let payload;
       try {
         payload = verifyToken(signed);
-      } catch {
+      } catch (err) {
+        logError("proxy.verify", err, { token: truncateString(signed, 200) });
         res.writeHead(403).end("Invalid signature");
         return;
       }
 
       const upstreamUrl = new URL(payload.u);
+      const upstreamStr = upstreamUrl.toString();
+      const sourceUrl = payload.src || null;
       const range = req.headers.range;
       const ua = req.headers["user-agent"] || UA_DEFAULT;
+
+      logEvent("info", "proxy.received", {
+        method: req.method,
+        upstreamUrl: truncateString(upstreamStr, 500),
+        sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+        range: range || undefined,
+      });
 
       const h = {
         "User-Agent": ua,
@@ -479,13 +608,16 @@ const server = http.createServer(async (req, res) => {
       let upstream;
       try {
         upstream = await fetchUpstreamWithRetry(
-          upstreamUrl.toString(),
+          upstreamStr,
           { method: req.method, headers: h },
-          Math.max(UPSTREAM_TIMEOUT_MS / 2, 8000),
+          UPSTREAM_INACTIVITY_MS,
           1
         );
       } catch (err) {
-        console.error("fetch upstream failed:", err);
+        logError("proxy.fetch", err, {
+          upstreamUrl: truncateString(upstreamStr, 500),
+          sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+        });
         res.writeHead(502).end("Upstream fetch failed");
         return;
       }
@@ -502,13 +634,18 @@ const server = http.createServer(async (req, res) => {
           upstreamUrl,
           selfOrigin,
           HLS_TOKEN_TTL_SEC,
-          payload.h || null
+          payload.h || null,
+          sourceUrl || upstreamStr
         );
         res.setHeader("Cache-Control", "no-store");
         res
           .writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" })
           .end(rewritten);
-        console.log(`[END] /proxy (m3u8) in ${Date.now() - started}ms`);
+        logEvent("info", "proxy.m3u8", {
+          upstreamUrl: truncateString(upstreamStr, 500),
+          sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+          durationMs: Date.now() - started,
+        });
         return;
       }
 
@@ -529,14 +666,37 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === "HEAD") {
         res.end();
-        console.log(`[END] /proxy HEAD in ${Date.now() - started}ms`);
+        logEvent("info", "proxy.headComplete", {
+          upstreamUrl: truncateString(upstreamStr, 500),
+          sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+          durationMs: Date.now() - started,
+        });
         return;
       }
 
+      let proxyLogDone = false;
+      const logProxyComplete = () => {
+        if (proxyLogDone) return;
+        proxyLogDone = true;
+        logEvent("info", "proxy.complete", {
+          upstreamUrl: truncateString(upstreamStr, 500),
+          sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+          durationMs: Date.now() - started,
+        });
+      };
+
+      res.once("close", logProxyComplete);
+      res.once("finish", logProxyComplete);
+      res.once("error", logProxyComplete);
+
       try {
         if (upstream.nodeStream) {
-          upstream.nodeStream.on("data", () => (lastActivityAt = Date.now()));
-          upstream.nodeStream.on("error", () => {
+          upstream.nodeStream.on("data", noteActivity);
+          upstream.nodeStream.on("error", (streamErr) => {
+            logError("proxy.stream", streamErr, {
+              upstreamUrl: truncateString(upstreamStr, 500),
+              sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+            });
             try {
               res.end();
             } catch {}
@@ -544,8 +704,12 @@ const server = http.createServer(async (req, res) => {
           upstream.nodeStream.pipe(res);
         } else if (resp.body) {
           const nodeReadable = Readable.fromWeb(resp.body);
-          nodeReadable.on("data", () => (lastActivityAt = Date.now()));
-          nodeReadable.on("error", () => {
+          nodeReadable.on("data", noteActivity);
+          nodeReadable.on("error", (streamErr) => {
+            logError("proxy.stream", streamErr, {
+              upstreamUrl: truncateString(upstreamStr, 500),
+              sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+            });
             try {
               res.end();
             } catch {}
@@ -555,12 +719,13 @@ const server = http.createServer(async (req, res) => {
           res.end();
         }
       } catch (e) {
-        console.error("stream pipe error:", e);
+        logError("proxy.pipe", e, {
+          upstreamUrl: truncateString(upstreamStr, 500),
+          sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+        });
         try {
           res.end();
         } catch {}
-      } finally {
-        console.log(`[END] /proxy passthrough in ${Date.now() - started}ms`);
       }
       return;
     }
@@ -568,7 +733,10 @@ const server = http.createServer(async (req, res) => {
     // 404
     res.writeHead(404, { "Content-Type": "text/plain" }).end("Not found");
   } catch (e) {
-    console.error("server error:", e);
+    logError("server.handler", e, {
+      path: u.pathname,
+      method: req.method,
+    });
     try {
       res.writeHead(500).end(String(e));
     } catch {}
@@ -590,15 +758,8 @@ function streamToString(stream) {
 server.keepAliveTimeout = 5000;
 server.headersTimeout = 8000;
 
-server.listen(PORT, () => console.log(`resolver+proxy listening on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`resolver+proxy listening on :${PORT}`);
+  scheduleExitCheck();
+});
 
-// ---------- idle exit ----------
-if (AUTO_EXIT_IDLE_MS > 0) {
-  setInterval(() => {
-    const idle = Date.now() - lastActivityAt;
-    if (idle > AUTO_EXIT_IDLE_MS) {
-      console.log(`[EXIT] idle ${idle}ms > ${AUTO_EXIT_IDLE_MS}ms, exiting`);
-      setTimeout(() => process.exit(0), 200);
-    }
-  }, Math.min(AUTO_EXIT_IDLE_MS, 10000));
-}
