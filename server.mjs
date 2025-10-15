@@ -22,6 +22,7 @@ const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
 const HLS_TOKEN_TTL_SEC = parseInt(process.env.HLS_TOKEN_TTL_SEC || "1800", 10);
 
 let lastActivityAt = Date.now();
+let activeRequests = 0;
 
 // ---------- utils ----------
 const b64url = (b) =>
@@ -58,6 +59,24 @@ function logError(scope, error, meta = {}) {
   const message = error?.message || String(error);
   logEvent("error", scope, { ...meta, error: message });
   if (error?.stack) console.error(error.stack);
+}
+
+function trackActiveRequest(res) {
+  activeRequests += 1;
+  let released = false;
+
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeRequests = Math.max(0, activeRequests - 1);
+    lastActivityAt = Date.now();
+  };
+
+  res.on("close", release);
+  res.on("finish", release);
+  res.on("error", release);
+
+  return release;
 }
 
 function signToken(payloadObj) {
@@ -324,6 +343,7 @@ async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
   lastActivityAt = Date.now();
+  trackActiveRequest(res);
   const started = Date.now();
   const selfOrigin = getSelfOrigin(req);
   const u = new URL(req.url, `${selfOrigin}`);
@@ -708,6 +728,7 @@ server.listen(PORT, () => console.log(`resolver+proxy listening on :${PORT}`));
 // ---------- idle exit ----------
 if (AUTO_EXIT_IDLE_MS > 0) {
   setInterval(() => {
+    if (activeRequests > 0) return;
     const idle = Date.now() - lastActivityAt;
     if (idle > AUTO_EXIT_IDLE_MS) {
       console.log(`[EXIT] idle ${idle}ms > ${AUTO_EXIT_IDLE_MS}ms, exiting`);
