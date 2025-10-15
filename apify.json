@@ -1,0 +1,9 @@
+{
+  "name": "apify-yt-resolver",
+  "version": "0.1",
+  "buildTag": "latest",
+  "defaultRunOptions": {
+    "build": "npm --quiet install --only=prod",
+    "start": "node server.mjs"
+  }
+}
