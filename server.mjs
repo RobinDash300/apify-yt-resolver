@@ -65,6 +65,24 @@ function getSelfOrigin(req) {
   return `${proto}://${host}`;
 }
 
+// [NEW] --- simple cookie preflight for TikTok/Reddit ---
+async function getOriginCookieHeader(originUrl) {
+  try {
+    const resp = await fetch(originUrl, { redirect: "follow" });
+    // Combine multiple Set-Cookie lines into one Cookie header (name=value pairs)
+    const setc = resp.headers.get("set-cookie");
+    if (!setc) return "";
+    const cookie = setc
+      .split(/,(?=[^ ;]+=)/)               // split multiple Set-Cookie headers
+      .map(s => s.split(";")[0].trim())    // keep only name=value
+      .filter(Boolean)
+      .join("; ");
+    return cookie;                          // e.g. "tt_webid_v2=...; s_v_web_id=..."
+  } catch {
+    return "";
+  }
+}
+
 // ---------- HLS helpers ----------
 function toAbsoluteUrl(base, ref) {
   try {
@@ -116,43 +134,65 @@ function looksDirectMedia(urlStr) {
 }
 
 // ---------- yt-dlp ----------
-function ytdlpJson(userUrl) {
-  return new Promise((resolve, reject) => {
-    // Add UA + Referer to improve extraction reliability from DC IPs
-    let referer = "";
-    try {
-      const u = new URL(userUrl);
-      referer = u.origin;
-      if (u.host.includes("tiktok")) referer = "https://www.tiktok.com/";
-      if (u.host.includes("youtube.") || u.host.includes("youtu.be")) referer = "https://www.youtube.com/";
-      if (u.host.includes("reddit.")) referer = "https://www.reddit.com/";
-    } catch {}
+// [CHANGE] make this function async so we can do a tiny cookie preflight
+async function ytdlpJson(userUrl) {
+  // Add UA + Referer to improve extraction reliability from DC IPs
+  let referer = "";
+  try {
+    const u = new URL(userUrl);
+    referer = u.origin;
+    if (u.host.includes("tiktok")) referer = "https://www.tiktok.com/";
+    if (u.host.includes("youtube.") || u.host.includes("youtu.be")) referer = "https://www.youtube.com/";
+    if (u.host.includes("reddit.")) referer = "https://www.reddit.com/";
+  } catch {}
 
-    const args = [
-      "-j",
-      "--no-warnings",
-      "--skip-download",
-      "--no-call-home",
-      "--geo-bypass",
-      "--user-agent",
-      UA_DEFAULT,
-      "--add-header",
-      `Referer:${referer || userUrl}`,
-      userUrl,
-    ];
+  // [NEW] detect TikTok so we DON'T force our own UA for yt-dlp (let it impersonate)
+  const isTikTok = (() => {
+    try { return new URL(userUrl).host.includes("tiktok"); } catch { return false; }
+  })();
 
+  const args = [
+    "-j",
+    "--no-warnings",
+    "--skip-download",
+    "--no-call-home",
+    "--geo-bypass",
+  ];
+
+  // [NEW] Only force UA for non-TikTok (keeps TikTok stable)
+  if (!isTikTok) {
+    args.push("--user-agent", UA_DEFAULT);
+  }
+
+  // Keep referer and add a permissive Accept (helps some Reddit/GIF edge cases)
+  args.push("--add-header", `Referer:${referer || userUrl}`);
+  // [NEW]
+  args.push("--add-header", "Accept:*/*");
+
+  // [NEW] Best-effort cookie preflight for TikTok/Reddit
+  try {
+    const host = new URL(userUrl).host;
+    if (host.includes("tiktok")) {
+      const preC = await getOriginCookieHeader("https://www.tiktok.com/");
+      if (preC) args.push("--add-header", `Cookie:${preC}`);
+    } else if (host.includes("reddit")) {
+      const preC = await getOriginCookieHeader("https://www.reddit.com/");
+      if (preC) args.push("--add-header", `Cookie:${preC}`);
+    }
+  } catch {}
+
+  args.push(userUrl);
+
+  // spawn yt-dlp and collect JSON lines
+  return await new Promise((resolve, reject) => {
     const p = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "",
-      err = "";
-    p.stdout.on("data", (d) => (out += d));
-    p.stderr.on("data", (d) => (err += d));
+    let out = "", err = "";
+    p.stdout.on("data", d => (out += d));
+    p.stderr.on("data", d => (err += d));
     p.on("close", (code) => {
       if (code !== 0 || !out.trim()) return reject(new Error(err || `yt-dlp exited ${code}`));
       try {
-        const lines = out
-          .trim()
-          .split(/\r?\n/)
-          .map((l) => JSON.parse(l));
+        const lines = out.trim().split(/\r?\n/).map(l => JSON.parse(l));
         resolve(lines);
       } catch (e) {
         reject(e);
@@ -366,6 +406,20 @@ const server = http.createServer(async (req, res) => {
             } catch {}
           }
 
+          // [FIX] add a cookie fallback for TikTok/Reddit if missing (use pageUrl here)
+          try {
+            const host = new URL(pageUrl).host || "";
+            if (!upstreamHeaders["Cookie"]) {
+              if (host.includes("tiktok")) {
+                const c = await getOriginCookieHeader("https://www.tiktok.com/");
+                if (c) upstreamHeaders["Cookie"] = c;
+              } else if (host.includes("reddit")) {
+                const c = await getOriginCookieHeader("https://www.reddit.com/");
+                if (c) upstreamHeaders["Cookie"] = c;
+              }
+            }
+          } catch {}
+
           const meta = metaFrom
             ? {
                 title: metaFrom.title,
@@ -404,9 +458,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // [NEW] print the received input URL
-      console.log(`[INPUT] inputUrl: ${abs}`);
-
       let abs;
       try {
         abs = new URL(input).toString();
@@ -414,6 +465,10 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400).end('{"ok":false,"error":"Bad URL"}');
         return;
       }
+
+      // [FIX] print AFTER abs is defined
+      console.log(`[INPUT] inputUrl: ${abs}`);
+
 
       try {
         let mediaUrl = abs;
@@ -441,6 +496,20 @@ const server = http.createServer(async (req, res) => {
             else upstreamHeaders["Referer"] = new URL(abs).origin;
           } catch {}
         }
+
+        // [FIX] add a cookie fallback for TikTok/Reddit if missing (use abs here)
+        try {
+          const host = new URL(abs).host || "";
+          if (!upstreamHeaders["Cookie"]) {
+            if (host.includes("tiktok")) {
+              const c = await getOriginCookieHeader("https://www.tiktok.com/");
+              if (c) upstreamHeaders["Cookie"] = c;
+            } else if (host.includes("reddit")) {
+              const c = await getOriginCookieHeader("https://www.reddit.com/");
+              if (c) upstreamHeaders["Cookie"] = c;
+            }
+          }
+        } catch {}
 
         const expiresAt = nowSec() + TOKEN_TTL_SEC;
         const signed = signToken({ u: mediaUrl, exp: expiresAt, h: upstreamHeaders });
