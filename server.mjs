@@ -648,6 +648,21 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      let proxyLogDone = false;
+      const logProxyComplete = () => {
+        if (proxyLogDone) return;
+        proxyLogDone = true;
+        logEvent("info", "proxy.complete", {
+          upstreamUrl: truncateString(upstreamStr, 500),
+          sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+          durationMs: Date.now() - started,
+        });
+      };
+
+      res.once("close", logProxyComplete);
+      res.once("finish", logProxyComplete);
+      res.once("error", logProxyComplete);
+
       try {
         if (upstream.nodeStream) {
           upstream.nodeStream.on("data", () => (lastActivityAt = Date.now()));
@@ -723,7 +738,10 @@ function streamToString(stream) {
 server.keepAliveTimeout = 5000;
 server.headersTimeout = 8000;
 
-server.listen(PORT, () => console.log(`resolver+proxy listening on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`resolver+proxy listening on :${PORT}`);
+  scheduleExitCheck();
+});
 
 // ---------- idle exit ----------
 if (AUTO_EXIT_IDLE_MS > 0) {
