@@ -335,6 +335,10 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
+          // [NEW] print the received input URL
+          console.log(`[INPUT] inputUrl: ${pageUrl}`);
+
+
           let mediaUrl = pageUrl;
           let headers = null;
           let metaFrom = null;
@@ -399,6 +403,9 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400).end('{"ok":false,"error":"Missing u"}');
         return;
       }
+
+      // [NEW] print the received input URL
+      console.log(`[INPUT] inputUrl: ${abs}`);
 
       let abs;
       try {
