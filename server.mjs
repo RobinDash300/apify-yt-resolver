@@ -15,8 +15,6 @@ const UA_DEFAULT =
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "25000", 10);
 const AUTO_EXIT_IDLE_MS = parseInt(process.env.AUTO_EXIT_IDLE_MS || "0", 10);
 const PROXY_PARAM = process.env.PROXY_PARAM || "sig"; // do not use "token" here
-// NEW: longer TTL just for nested HLS resources (segments/keys/maps)
-const HLS_TOKEN_TTL_SEC = parseInt(process.env.HLS_TOKEN_TTL_SEC || "1800", 10);
 
 let lastActivityAt = Date.now();
 
@@ -55,7 +53,7 @@ function cors(res) {
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   res.setHeader("Timing-Allow-Origin", CORS_ALLOW);
   res.setHeader("Vary", "Origin, Range");
-  // IMPORTANT: do NOT force "Connection: close" here; keep-alive improves seek stability
+  res.setHeader("Connection", "close");
 }
 function getSelfOrigin(req) {
   const proto = req.headers["x-forwarded-proto"] || "http";
@@ -165,76 +163,6 @@ function pickBest(lines) {
       metaFrom: single,
     };
   return null;
-}
-
-// ---------- robust upstream fetch (GET even for HEAD) ----------
-async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1) {
-  let attempt = 0;
-  let lastErr;
-  while (attempt <= maxRetries) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-    try {
-      const resp = await fetch(urlStr, {
-        ...opts,
-        // Always GET upstream to avoid HEAD 405/slow paths; we will discard body on HEAD later.
-        method: "GET",
-        signal: controller.signal,
-        redirect: "follow",
-      });
-      clearTimeout(timeout);
-
-      if (!resp.ok && resp.status >= 500 && attempt < maxRetries) {
-        attempt++;
-        lastErr = new Error(`Upstream ${resp.status}`);
-        continue;
-      }
-
-      // Inactivity watchdog: abort if no data chunks for inactivityMs after first byte wait
-      if (resp.body && inactivityMs > 0) {
-        const reader = resp.body.getReader();
-        let gotFirstByte = false;
-        let inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
-
-        const stream = new Readable({
-          read() {},
-        });
-
-        (async () => {
-          try {
-            for (;;) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (!gotFirstByte) gotFirstByte = true;
-              lastActivityAt = Date.now();
-              clearTimeout(inactivityTimer);
-              inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
-              stream.push(Buffer.from(value));
-            }
-            clearTimeout(inactivityTimer);
-            stream.push(null);
-          } catch (e) {
-            clearTimeout(inactivityTimer);
-            stream.destroy(e);
-          }
-        })();
-
-        return { resp, nodeStream: stream, usedGetForHead: opts.method === "HEAD" };
-      }
-
-      // No body
-      return { resp, nodeStream: null, usedGetForHead: opts.method === "HEAD" };
-    } catch (e) {
-      clearTimeout(timeout);
-      lastErr = e;
-      if (attempt < maxRetries) {
-        attempt++;
-        continue;
-      }
-      throw lastErr;
-    }
-  }
-  throw lastErr || new Error("Unknown upstream error");
 }
 
 // ---------- server ----------
@@ -428,36 +356,37 @@ const server = http.createServer(async (req, res) => {
       const h = { "User-Agent": ua };
       if (payload.h?.["Referer"]) h["Referer"] = payload.h["Referer"];
       if (payload.h?.["Cookie"]) h["Cookie"] = payload.h["Cookie"];
-      if (range) h["Range"] = range;
 
-      // Use robust fetch with retry and inactivity watchdog (half of overall timeout).
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+
       let upstream;
       try {
-        upstream = await fetchUpstreamWithRetry(
-          upstreamUrl.toString(),
-          { method: req.method, headers: h },
-          Math.max(UPSTREAM_TIMEOUT_MS / 2, 8000),
-          1
-        );
+        upstream = await fetch(upstreamUrl.toString(), {
+          method: req.method, // GET or HEAD
+          redirect: "follow",
+          headers: { ...(range ? { Range: range } : {}), ...h },
+          signal: controller.signal,
+        });
       } catch (err) {
+        clearTimeout(t);
         console.error("fetch upstream failed:", err);
         res.writeHead(502).end("Upstream fetch failed");
         return;
+      } finally {
+        clearTimeout(t);
       }
 
-      const resp = upstream.resp;
-      const ct = resp.headers.get("content-type") || "";
+      const ct = upstream.headers.get("content-type") || "";
 
       // If HLS, rewrite playlist so nested URIs also go through our proxy
       if (req.method === "GET" && looksLikeM3U8(upstreamUrl, ct)) {
-        const manifest = upstream.nodeStream
-          ? await streamToString(upstream.nodeStream)
-          : await resp.text();
+        const manifest = await upstream.text();
         const rewritten = rewriteM3U8(
           manifest,
           upstreamUrl,
           selfOrigin,
-          HLS_TOKEN_TTL_SEC, // use longer TTL for nested HLS resources
+          TOKEN_TTL_SEC,
           payload.h || null
         );
         res.setHeader("Cache-Control", "no-store");
@@ -469,21 +398,18 @@ const server = http.createServer(async (req, res) => {
       }
 
       // pass through headers needed for playback and canvas
-      const acceptRanges = resp.headers.get("accept-ranges");
-      const contentRange = resp.headers.get("content-range");
-      const contentLength = resp.headers.get("content-length");
-      const contentType = resp.headers.get("content-type");
+      const acceptRanges = upstream.headers.get("accept-ranges");
+      const contentRange = upstream.headers.get("content-range");
+      const contentLength = upstream.headers.get("content-length");
+      const contentType = upstream.headers.get("content-type");
 
       if (acceptRanges) res.setHeader("Accept-Ranges", acceptRanges);
-      else if (range) res.setHeader("Accept-Ranges", "bytes"); // hint to player during seeks
-
       if (contentRange) res.setHeader("Content-Range", contentRange);
       if (contentLength) res.setHeader("Content-Length", contentLength);
       if (contentType) res.setHeader("Content-Type", contentType);
       if (!res.getHeader("Cache-Control")) res.setHeader("Cache-Control", "no-store");
 
-      // If client sent HEAD, we still fetched via GET upstream; mirror status and headers, no body.
-      res.writeHead(resp.status);
+      res.writeHead(upstream.status);
 
       if (req.method === "HEAD") {
         res.end();
@@ -492,19 +418,11 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        if (upstream.nodeStream) {
-          upstream.nodeStream.on("data", () => {
+        if (upstream.body) {
+          const nodeReadable = Readable.fromWeb(upstream.body);
+          nodeReadable.on("data", () => {
             lastActivityAt = Date.now();
           });
-          upstream.nodeStream.on("error", () => {
-            try {
-              res.end();
-            } catch {}
-          });
-          upstream.nodeStream.pipe(res);
-        } else if (resp.body) {
-          const nodeReadable = Readable.fromWeb(resp.body);
-          nodeReadable.on("data", () => (lastActivityAt = Date.now()));
           nodeReadable.on("error", () => {
             try {
               res.end();
@@ -534,17 +452,6 @@ const server = http.createServer(async (req, res) => {
     } catch {}
   }
 });
-
-// Helper for reading a stream into string (used for m3u8 rewrite when we already have a node stream)
-function streamToString(stream) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    stream.setEncoding("utf8");
-    stream.on("data", (chunk) => (data += chunk));
-    stream.on("end", () => resolve(data));
-    stream.on("error", reject);
-  });
-}
 
 // ---------- server tune ----------
 server.keepAliveTimeout = 5000;
