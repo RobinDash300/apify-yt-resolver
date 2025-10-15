@@ -24,6 +24,71 @@ const HLS_TOKEN_TTL_SEC = parseInt(process.env.HLS_TOKEN_TTL_SEC || "1800", 10);
 let lastActivityAt = Date.now();
 let activeRequests = 0;
 
+const idleController = (() => {
+  if (AUTO_EXIT_IDLE_MS <= 0) {
+    const noop = () => {};
+    return {
+      start: noop,
+      activity: noop,
+      track: () => noop,
+    };
+  }
+
+  let trackedActive = 0;
+  let timer = null;
+
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      if (trackedActive > 0) {
+        schedule();
+        return;
+      }
+      const idle = Date.now() - lastActivityAt;
+      if (idle >= AUTO_EXIT_IDLE_MS) {
+        console.log(`[EXIT] idle ${idle}ms >= ${AUTO_EXIT_IDLE_MS}ms, exiting`);
+        setTimeout(() => process.exit(0), 200);
+      } else {
+        schedule();
+      }
+    }, AUTO_EXIT_IDLE_MS);
+    if (typeof timer.unref === "function") timer.unref();
+  };
+
+  const mark = () => {
+    lastActivityAt = Date.now();
+    schedule();
+  };
+
+  const track = (res) => {
+    trackedActive += 1;
+    let released = false;
+
+    const release = () => {
+      if (released) return;
+      released = true;
+      trackedActive = Math.max(0, trackedActive - 1);
+      mark();
+    };
+
+    res.on("close", release);
+    res.on("finish", release);
+    res.on("error", release);
+
+    return release;
+  };
+
+  return {
+    start: () => {
+      lastActivityAt = Date.now();
+      schedule();
+    },
+    activity: mark,
+    track,
+  };
+})();
+
 // ---------- utils ----------
 const b64url = (b) =>
   Buffer.from(b).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
