@@ -23,7 +23,6 @@ const HLS_TOKEN_TTL_SEC = parseInt(process.env.HLS_TOKEN_TTL_SEC || "1800", 10);
 
 let lastActivityAt = Date.now();
 let activeRequests = 0;
-let exitTimer = null;
 
 // ---------- utils ----------
 const b64url = (b) =>
@@ -62,31 +61,6 @@ function logError(scope, error, meta = {}) {
   if (error?.stack) console.error(error.stack);
 }
 
-function scheduleExitCheck() {
-  if (AUTO_EXIT_IDLE_MS <= 0) return;
-  if (exitTimer) clearTimeout(exitTimer);
-  exitTimer = setTimeout(() => {
-    exitTimer = null;
-    if (activeRequests > 0) {
-      scheduleExitCheck();
-      return;
-    }
-    const idle = Date.now() - lastActivityAt;
-    if (idle >= AUTO_EXIT_IDLE_MS) {
-      console.log(`[EXIT] idle ${idle}ms >= ${AUTO_EXIT_IDLE_MS}ms, exiting`);
-      setTimeout(() => process.exit(0), 200);
-    } else {
-      scheduleExitCheck();
-    }
-  }, AUTO_EXIT_IDLE_MS);
-  if (typeof exitTimer.unref === "function") exitTimer.unref();
-}
-
-function noteActivity() {
-  lastActivityAt = Date.now();
-  scheduleExitCheck();
-}
-
 function trackActiveRequest(res) {
   activeRequests += 1;
   let released = false;
@@ -95,7 +69,7 @@ function trackActiveRequest(res) {
     if (released) return;
     released = true;
     activeRequests = Math.max(0, activeRequests - 1);
-    noteActivity();
+    lastActivityAt = Date.now();
   };
 
   res.on("close", release);
@@ -335,7 +309,7 @@ async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1
               for (;;) {
                 const { done, value } = await reader.read();
                 if (done) break;
-                noteActivity();
+                lastActivityAt = Date.now();
                 clearTimeout(inactivityTimer);
                 inactivityTimer = setTimeout(() => controller.abort(), inactivityMs);
                 nodeStream.push(Buffer.from(value));
@@ -368,7 +342,7 @@ async function fetchUpstreamWithRetry(urlStr, opts, inactivityMs, maxRetries = 1
 
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
-  noteActivity();
+  lastActivityAt = Date.now();
   trackActiveRequest(res);
   const started = Date.now();
   const selfOrigin = getSelfOrigin(req);
@@ -691,7 +665,7 @@ const server = http.createServer(async (req, res) => {
 
       try {
         if (upstream.nodeStream) {
-          upstream.nodeStream.on("data", noteActivity);
+          upstream.nodeStream.on("data", () => (lastActivityAt = Date.now()));
           upstream.nodeStream.on("error", (streamErr) => {
             logError("proxy.stream", streamErr, {
               upstreamUrl: truncateString(upstreamStr, 500),
@@ -704,7 +678,7 @@ const server = http.createServer(async (req, res) => {
           upstream.nodeStream.pipe(res);
         } else if (resp.body) {
           const nodeReadable = Readable.fromWeb(resp.body);
-          nodeReadable.on("data", noteActivity);
+          nodeReadable.on("data", () => (lastActivityAt = Date.now()));
           nodeReadable.on("error", (streamErr) => {
             logError("proxy.stream", streamErr, {
               upstreamUrl: truncateString(upstreamStr, 500),
@@ -726,6 +700,12 @@ const server = http.createServer(async (req, res) => {
         try {
           res.end();
         } catch {}
+      } finally {
+        logEvent("info", "proxy.complete", {
+          upstreamUrl: truncateString(upstreamStr, 500),
+          sourceUrl: sourceUrl ? truncateString(sourceUrl, 500) : null,
+          durationMs: Date.now() - started,
+        });
       }
       return;
     }
@@ -763,3 +743,14 @@ server.listen(PORT, () => {
   scheduleExitCheck();
 });
 
+// ---------- idle exit ----------
+if (AUTO_EXIT_IDLE_MS > 0) {
+  setInterval(() => {
+    if (activeRequests > 0) return;
+    const idle = Date.now() - lastActivityAt;
+    if (idle > AUTO_EXIT_IDLE_MS) {
+      console.log(`[EXIT] idle ${idle}ms > ${AUTO_EXIT_IDLE_MS}ms, exiting`);
+      setTimeout(() => process.exit(0), 200);
+    }
+  }, Math.min(AUTO_EXIT_IDLE_MS, 10000));
+}
